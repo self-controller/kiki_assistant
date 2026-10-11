@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+    />
+    <title>Kiki Settings</title>
+  </head>
+  <body>
+    <form id="form" class="settings" novalidate>
+      <header>
+        <h1>Kiki</h1>
+        <p class="hint">Highlight text in any app, press your hotkey, and ask about it.</p>
+      </header>
+
+      <section>
+        <h2>Connection</h2>
+        <label>
+          <span>Server address</span>
+          <input id="serverUrl" type="url" placeholder="https://kiki.example.com" required />
+        </label>
+        <label>
+          <span>Access code</span>
+          <input id="accessCode" type="password" autocomplete="off" spellcheck="false" placeholder="kiki_…" />
+        </label>
+        <div class="row">
+          <button id="test" type="button">Save and test connection</button>
+          <span id="testResult" class="hint" role="status"></span>
+        </div>
+        <p id="storageWarning" class="warn" hidden></p>
+      </section>
+
+      <section>
+        <h2>Hotkey</h2>
+        <label>
+          <span>Shortcut</span>
+          <input id="hotkey" type="text" placeholder="Ctrl+Alt+K" spellcheck="false" />
+        </label>
+        <p id="hotkeyError" class="warn" hidden></p>
+        <div id="linuxShortcut" hidden>
+          <div class="row">
+            <button id="installShortcut" type="button">Install GNOME shortcut</button>
+            <span id="shortcutStatus" class="hint" role="status"></span>
+          </div>
+          <p class="hint">
+            On Wayland, apps can't listen for keys themselves, so Kiki adds a GNOME keyboard shortcut that runs:
+            <code id="shortcutCommand"></code>
+          </p>
+        </div>
+      </section>
+
+      <section id="linuxPopup" hidden>
+        <h2>Popup</h2>
+        <div class="row">
+          <button id="installExtension" type="button">Install GNOME helper</button>
+          <span id="extensionStatus" class="hint" role="status"></span>
+        </div>
+        <p class="hint">
+          On Wayland, apps can't place their own windows, so Kiki adds a small GNOME Shell extension that opens
+          the popup next to the pointer. It also takes Kiki's screenshots of the window you were in, around the
+          pointer. GNOME loads it the next time you log in.
+        </p>
+      </section>
+
+      <section>
+        <h2>Context</h2>
+        <label>
+          <span>Screenshot</span>
+          <select id="screenshot">
+            <option value="auto">Only when the window's text isn't available</option>
+            <option value="always">Always attach one</option>
+            <option value="never">Never</option>
+          </select>
+        </label>
+        <p class="hint">Before you send a question, the popup shows what will be shared, and you can remove any of it.</p>
+
+        <div id="linuxA11y" hidden>
+          <div class="row">
+            <button id="enableA11y" type="button">Read text in browsers</button>
+            <span id="a11yStatus" class="hint" role="status"></span>
+          </div>
+          <p class="hint">
+            Turns on GNOME accessibility support so browsers and Electron apps share their text with Kiki. Restart
+            the browser afterwards.
+          </p>
+          <p id="linuxProblems" class="warn" hidden></p>
+        </div>
+
+        <div id="macPerms" hidden>
+          <div class="row">
+            <button id="macPermissions" type="button">Grant permissions</button>
+            <span id="macStatus" class="hint" role="status"></span>
+          </div>
+          <p class="hint">
+            Accessibility lets Kiki read the selected text. Screen Recording lets it see the page around it.
+          </p>
+        </div>
+      </section>
+
+      <section>
+        <h2>General</h2>
+        <label class="check">
+          <input id="launchAtLogin" type="checkbox" />
+          <span>Start Kiki when I log in</span>
+        </label>
+      </section>
+
+      <footer>
+        <button id="quit" type="button">Quit Kiki</button>
+        <span id="saveStatus" class="hint" role="status"></span>
+        <button id="save" class="primary" type="submit">Save</button>
+      </footer>
+    </form>
+    <script type="module" src="./settings.ts"></script>
+  </body>
+</html>

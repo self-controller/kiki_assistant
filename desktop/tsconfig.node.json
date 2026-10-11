@@ -1,0 +1,9 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true
+  },
+  "include": ["electron.vite.config.ts", "src/main", "src/preload", "src/shared-types.ts", "src/env.d.ts", "test"]
+}

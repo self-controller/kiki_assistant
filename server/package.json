@@ -1,0 +1,29 @@
+{
+  "name": "@kiki/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "dev": "node --watch --disable-warning=ExperimentalWarning src/index.ts",
+    "start": "node --disable-warning=ExperimentalWarning src/index.ts",
+    "codes": "node --disable-warning=ExperimentalWarning src/cli.ts",
+    "smoke": "node --disable-warning=ExperimentalWarning scripts/smoke.ts",
+    "mock": "node --disable-warning=ExperimentalWarning scripts/mock-server.ts",
+    "service": "node --disable-warning=ExperimentalWarning scripts/service.ts",
+    "test": "vitest run",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.133.0",
+    "@hono/node-server": "^2.1.4",
+    "@kiki/shared": "*",
+    "hono": "^4.13.13",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "vitest": "^5.0.3"
+  }
+}

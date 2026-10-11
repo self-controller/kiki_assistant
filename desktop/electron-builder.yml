@@ -1,0 +1,34 @@
+appId: app.kiki.desktop
+productName: Kiki
+directories:
+  output: release
+  buildResources: resources
+files:
+  - out/**
+  - resources/icon.png
+  - resources/trayTemplate*.png
+  - package.json
+extraResources:
+  - from: resources/kiki_context.py
+    to: kiki_context.py
+  - from: resources/gnome-extension
+    to: gnome-extension
+    filter: ["**/*", "!**/*.d.ts"]
+linux:
+  target: [AppImage, rpm, deb]
+  executableName: kiki
+  category: Utility
+  icon: resources/icon.png
+  synopsis: Highlight text anywhere and ask Kiki about it
+rpm:
+  depends: [wl-clipboard, python3-gobject, at-spi2-core]
+deb:
+  depends: [wl-clipboard, python3-gi, gir1.2-atspi-2.0]
+mac:
+  target: dmg
+  category: public.app-category.productivity
+  icon: resources/icon.png
+  extendInfo:
+    LSUIElement: true
+    NSAppleEventsUsageDescription: Kiki reads the selected text and window title from the app you're using.
+    NSMicrophoneUsageDescription: Kiki records your voice only after you click the mic button, to turn your spoken question into text.

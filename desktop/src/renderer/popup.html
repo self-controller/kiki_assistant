@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en" class="popup-page">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:"
+    />
+    <title>Kiki</title>
+  </head>
+  <body>
+    <div id="popup" class="popup">
+      <div class="mascot" title="Drag to move Kiki" aria-hidden="true">
+        <svg viewBox="0 0 44 38" width="44" height="38">
+          <path class="mascot-body" d="M22 4 L40 34 L4 34 Z" />
+          <g class="mascot-eyes">
+            <circle class="eye" cx="17.5" cy="25" r="2.4" />
+            <circle class="eye" cx="26.5" cy="25" r="2.4" />
+          </g>
+        </svg>
+      </div>
+      <section id="card" class="card" aria-label="Kiki">
+        <button id="close" class="close" type="button" aria-label="Close" title="Close (Esc)"></button>
+        <div id="thread" class="thread" aria-live="polite">
+          <div id="threadContent" class="thread-content"></div>
+        </div>
+        <form id="composer" class="composer">
+          <div id="context" class="context">
+            <div id="chips" class="chips"></div>
+            <p id="notes" class="notes" hidden></p>
+          </div>
+          <div id="attachments" class="attachments" hidden></div>
+          <div class="field">
+            <textarea id="input" rows="1" placeholder="Ask about this…" aria-label="Your question"></textarea>
+          </div>
+          <div class="actions">
+            <div class="tools">
+              <button id="model" class="pill" type="button" aria-haspopup="menu" aria-expanded="false">
+                <span class="pill-icon"></span><span class="morph"></span>
+              </button>
+              <button id="effort" class="pill" type="button">
+                <span class="pill-icon"></span><span class="morph"></span>
+              </button>
+              <button id="search" class="pill toggle toggle-search" type="button" aria-pressed="false" title="Search the web">
+                <span class="pill-icon"></span><span class="toggle-label">Search</span>
+              </button>
+              <button id="screenshot" class="pill toggle toggle-screenshot" type="button" aria-pressed="false" hidden>
+                <span class="pill-icon"></span><span class="toggle-label">Screenshot</span>
+              </button>
+            </div>
+            <div class="tools">
+              <button id="attach" class="icon-button" type="button" aria-label="Add images" title="Add images"></button>
+              <input id="file" type="file" accept="image/*" multiple hidden />
+              <button id="send" class="send" type="submit" aria-label="Ask">
+                <span class="send-icon send-arrow"></span><span class="send-icon send-stop"></span>
+              </button>
+            </div>
+          </div>
+        </form>
+      </section>
+      <div id="modelMenu" class="model-menu" role="menu" aria-label="Model">
+        <div id="modelItems" class="menu-items"><span class="menu-highlight"></span></div>
+      </div>
+    </div>
+    <script type="module" src="./popup.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,7 @@
+{
+  "uuid": "kiki-popup@kiki.app",
+  "name": "Kiki",
+  "description": "Opens Kiki's chat box at the pointer. GNOME doesn't let apps place their own windows, so Kiki needs this helper.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version": 3
+}

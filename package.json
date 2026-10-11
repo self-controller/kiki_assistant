@@ -1,0 +1,22 @@
+{
+  "name": "kiki",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "shared",
+    "server",
+    "desktop"
+  ],
+  "scripts": {
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "dev:server": "npm run dev -w server",
+    "dev:desktop": "npm run dev -w desktop",
+    "codes": "npm run codes -w server --",
+    "mock": "npm run mock -w server"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "typescript": "^7.0.2"
+  }
+}

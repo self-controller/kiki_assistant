@@ -1,0 +1,301 @@
+import type Anthropic from "@anthropic-ai/sdk";
+import {
+  EFFORT_LEVELS,
+  LIMITS,
+  MODEL_CHOICES,
+  type ErrorCode,
+  type ErrorResponse,
+  type KikiEvent,
+  type FollowUpRequest,
+  type MeResponse,
+  type QuestionOptions,
+  type StartConversationRequest,
+  type TranscribeResponse,
+} from "@kiki/shared";
+import { Hono, type Context } from "hono";
+import { bodyLimit } from "hono/body-limit";
+import { streamSSE } from "hono/streaming";
+import { z } from "zod";
+import { classifyError, MODEL_IDS, runTurn, type ClaudeConfig } from "./claude.ts";
+import type { CodeRecord, CodeStore } from "./codes.ts";
+import type { Conversation, ConversationStore } from "./conversations.ts";
+import { buildFirstUserMessage, buildFollowUpMessage } from "./prompt.ts";
+import { audioExtension, SttError, transcribe, type SttConfig } from "./stt.ts";
+
+export interface AppDeps {
+  codes: CodeStore;
+  conversations: ConversationStore;
+  client: Anthropic;
+  config: ClaudeConfig;
+  /** Speech-to-text for voice questions; voice is off without it. */
+  stt?: SttConfig | null;
+  /** For tests: replaces fetch for transcription requests. */
+  sttFetch?: typeof fetch;
+  maxConcurrentPerCode?: number;
+  heartbeatMs?: number;
+  log?: (line: string) => void;
+}
+
+type Env = { Variables: { code: CodeRecord } };
+
+const screenshotSchema = z.object({
+  mediaType: z.enum(["image/jpeg", "image/png"]),
+  data: z
+    .string()
+    .min(1)
+    .max(LIMITS.screenshotBase64Chars)
+    .regex(/^[A-Za-z0-9+/]+={0,2}$/, "must be base64"),
+  area: z.enum(["screen", "pointer"]).optional(),
+});
+
+const imagesSchema = z.array(screenshotSchema).max(LIMITS.imagesPerQuestion).optional();
+
+const optionsSchema = z
+  .object({
+    search: z.boolean().optional(),
+    model: z.enum(MODEL_CHOICES).optional(),
+    effort: z.enum(EFFORT_LEVELS).optional(),
+    think: z.boolean().optional(),
+  })
+  .optional();
+
+const startSchema = z.object({
+  question: z.string().trim().min(1).max(LIMITS.questionChars),
+  selection: z.string().max(LIMITS.selectionChars),
+  context: z.object({
+    appName: z.string().max(LIMITS.appNameChars).optional(),
+    windowTitle: z.string().max(LIMITS.windowTitleChars).optional(),
+    text: z.string().max(LIMITS.contextTextChars).optional(),
+    screenshot: screenshotSchema.optional(),
+  }),
+  images: imagesSchema,
+  options: optionsSchema,
+});
+
+const followUpSchema = z.object({
+  question: z.string().trim().min(1).max(LIMITS.questionChars),
+  images: imagesSchema,
+  options: optionsSchema,
+});
+
+function errorJson(
+  c: Context,
+  status: 400 | 401 | 404 | 409 | 413 | 415 | 429 | 501 | 502,
+  code: ErrorCode,
+  message: string,
+) {
+  const body: ErrorResponse = { error: { code, message } };
+  return c.json(body, status);
+}
+
+async function readJson(c: Context): Promise<unknown> {
+  try {
+    return await c.req.json();
+  } catch {
+    return null;
+  }
+}
+
+export function createApp(deps: AppDeps) {
+  const { codes, conversations, client, config } = deps;
+  const stt = deps.stt ?? null;
+  const maxConcurrent = deps.maxConcurrentPerCode ?? 2;
+  const heartbeatMs = deps.heartbeatMs ?? 15_000;
+  const log = deps.log ?? ((line: string) => console.log(line));
+  const activeByCode = new Map<number, number>();
+
+  const app = new Hono<Env>();
+
+  app.get("/healthz", (c) => c.text("ok"));
+
+  app.use("/v1/*", async (c, next) => {
+    const match = /^Bearer\s+(\S+)$/i.exec(c.req.header("authorization") ?? "");
+    const record = match?.[1] ? codes.verify(match[1]) : null;
+    if (!record) {
+      return errorJson(c, 401, "unauthorized", "This access code is not valid or has been revoked.");
+    }
+    c.set("code", record);
+    await next();
+  });
+
+  const limitBody = bodyLimit({
+    maxSize: LIMITS.bodyBytes,
+    onError: (c) => errorJson(c, 413, "invalid", "The request is too large."),
+  });
+
+  app.get("/v1/me", (c) => {
+    const record = c.get("code");
+    const body: MeResponse = {
+      name: record.name,
+      usedToday: codes.usedToday(record.id),
+      dailyLimit: record.dailyLimit,
+      features: { voice: stt !== null },
+    };
+    return c.json(body);
+  });
+
+  /** Checks concurrency and the daily limit; returns an error response or null. */
+  function admit(c: Context<Env>, record: CodeRecord) {
+    if ((activeByCode.get(record.id) ?? 0) >= maxConcurrent) {
+      return errorJson(c, 429, "busy", "Too many questions at once. Wait for an answer to finish.");
+    }
+    if (!codes.tryConsume(record)) {
+      return errorJson(
+        c,
+        429,
+        "limit",
+        `You've reached today's limit of ${record.dailyLimit} questions. It resets at midnight UTC.`,
+      );
+    }
+    return null;
+  }
+
+  /** Streams one Claude turn for `conversation`, whose history already ends with the new user message. */
+  function streamTurn(
+    c: Context<Env>,
+    record: CodeRecord,
+    conversation: Conversation,
+    isFirstTurn: boolean,
+    options: QuestionOptions | undefined,
+  ) {
+    // The model can change between turns: the API skips earlier thinking the new model can't read.
+    const model = options?.model ? MODEL_IDS[options.model] : config.model;
+    const effort = options?.effort ?? (options?.think ? config.thinkEffort : config.effort);
+    conversation.busy = true;
+    conversation.userTurns += 1;
+    activeByCode.set(record.id, (activeByCode.get(record.id) ?? 0) + 1);
+    const startedAt = Date.now();
+
+    // Undo the user message so the history stays valid (and append-only) for the next turn.
+    const rollback = () => {
+      conversation.messages.pop();
+      conversation.userTurns -= 1;
+      if (isFirstTurn) conversations.delete(conversation.id);
+    };
+
+    return streamSSE(c, async (stream) => {
+      const controller = new AbortController();
+      stream.onAbort(() => controller.abort());
+
+      let writes = Promise.resolve();
+      const send = (event: KikiEvent) => {
+        writes = writes
+          .then(() => stream.writeSSE({ event: event.type, data: JSON.stringify(event) }))
+          .catch(() => {});
+      };
+      const heartbeat = setInterval(() => {
+        writes = writes.then(() => stream.write(": ping\n\n")).then(() => {}, () => {});
+      }, heartbeatMs);
+
+      send({ type: "conversation", id: conversation.id });
+      try {
+        const result = await runTurn({
+          client,
+          config,
+          history: conversation.messages,
+          emit: send,
+          signal: controller.signal,
+          model,
+          effort,
+        });
+        codes.recordUsage(record, result.usage);
+        const u = result.usage;
+        const stats = `${model} effort=${effort} in=${u.inputTokens} cache_read=${u.cacheReadTokens} out=${u.outputTokens} searches=${u.webSearches} ${Date.now() - startedAt}ms`;
+        if (result.kind === "refused") {
+          rollback();
+          log(`[kiki] ${record.name}: refused ${stats}`);
+          send({ type: "error", code: "refused", message: "Kiki can't help with this one." });
+        } else {
+          conversation.messages.push(...result.assistantMessages);
+          log(`[kiki] ${record.name}: ${result.stopReason} ${stats}`);
+          if (result.sources.length > 0) send({ type: "sources", items: result.sources });
+          send({ type: "done", stopReason: result.stopReason });
+        }
+      } catch (error) {
+        const info = classifyError(error);
+        rollback();
+        if (info.refundable) codes.refund(record);
+        if (info.log) console.error(`[kiki] ${record.name}: Claude request failed`, error);
+        if (!info.aborted) send({ type: "error", code: info.code, message: info.message });
+      } finally {
+        clearInterval(heartbeat);
+        conversation.busy = false;
+        conversation.lastUsed = conversations.now();
+        activeByCode.set(record.id, (activeByCode.get(record.id) ?? 1) - 1);
+        await writes;
+      }
+    });
+  }
+
+  app.post("/v1/conversations", limitBody, async (c) => {
+    const record = c.get("code");
+    const parsed = startSchema.safeParse(await readJson(c));
+    if (!parsed.success) {
+      return errorJson(c, 400, "invalid", `Invalid request: ${z.prettifyError(parsed.error)}`);
+    }
+    const rejected = admit(c, record);
+    if (rejected) return rejected;
+
+    const request: StartConversationRequest = parsed.data;
+    const conversation = conversations.create(record.id);
+    const today = new Date(conversations.now()).toISOString().slice(0, 10);
+    conversation.messages.push(buildFirstUserMessage(request, today));
+    return streamTurn(c, record, conversation, true, request.options);
+  });
+
+  app.post("/v1/conversations/:id/messages", limitBody, async (c) => {
+    const record = c.get("code");
+    const parsed = followUpSchema.safeParse(await readJson(c));
+    if (!parsed.success) {
+      return errorJson(c, 400, "invalid", `Invalid request: ${z.prettifyError(parsed.error)}`);
+    }
+    const conversation = conversations.get(c.req.param("id"), record.id);
+    if (!conversation) {
+      return errorJson(c, 404, "expired", "This conversation has expired. Ask again to start a new one.");
+    }
+    if (conversation.busy) {
+      return errorJson(c, 409, "busy", "Kiki is still answering the previous question.");
+    }
+    if (conversation.userTurns >= conversations.maxUserTurns) {
+      return errorJson(c, 409, "limit", "This conversation is getting long. Highlight the text again to start fresh.");
+    }
+    const rejected = admit(c, record);
+    if (rejected) return rejected;
+
+    const request: FollowUpRequest = parsed.data;
+    conversation.messages.push(buildFollowUpMessage(request));
+    return streamTurn(c, record, conversation, false, request.options);
+  });
+
+  const limitAudio = bodyLimit({
+    maxSize: LIMITS.audioBytes,
+    onError: (c) => errorJson(c, 413, "invalid", "That recording is too long."),
+  });
+
+  // Voice questions: the raw recording in, its transcript out. Doesn't count as a question.
+  app.post("/v1/transcribe", limitAudio, async (c) => {
+    const record = c.get("code");
+    if (!stt) return errorJson(c, 501, "invalid", "Voice questions aren't set up on this Kiki server.");
+    const mimeType = c.req.header("content-type") ?? "";
+    if (!audioExtension(mimeType)) return errorJson(c, 415, "invalid", "Unsupported audio format.");
+    if ((activeByCode.get(record.id) ?? 0) >= maxConcurrent) {
+      return errorJson(c, 429, "busy", "Too many requests at once. Try again in a moment.");
+    }
+    activeByCode.set(record.id, (activeByCode.get(record.id) ?? 0) + 1);
+    try {
+      const audio = await c.req.arrayBuffer();
+      if (audio.byteLength === 0) return errorJson(c, 400, "invalid", "The recording was empty.");
+      const text = await transcribe(stt, audio, mimeType, { fetch: deps.sttFetch });
+      const body: TranscribeResponse = { text };
+      return c.json(body);
+    } catch (error) {
+      if (!(error instanceof SttError)) console.error(`[kiki] ${record.name}: transcription failed`, error);
+      const message = error instanceof SttError ? error.message : "Transcription failed.";
+      return errorJson(c, 502, "upstream", message);
+    } finally {
+      activeByCode.set(record.id, (activeByCode.get(record.id) ?? 1) - 1);
+    }
+  });
+
+  return app;
+}

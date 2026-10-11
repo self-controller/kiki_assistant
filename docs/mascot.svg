@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-2 -2 48 42" width="96" height="84">
+  <style>
+    .eyes { transform-box: fill-box; transform-origin: center; animation: blink 5s ease-in-out infinite; }
+    @keyframes blink { 0%, 93%, 100% { transform: none; } 96% { transform: scaleY(0.1); } }
+  </style>
+  <path d="M22 4 L40 34 L4 34 Z" fill="#8b5cf6" stroke="#8b5cf6" stroke-width="6" stroke-linejoin="round"/>
+  <g class="eyes" fill="#000">
+    <circle cx="17.5" cy="25" r="2.4"/>
+    <circle cx="26.5" cy="25" r="2.4"/>
+  </g>
+</svg>
