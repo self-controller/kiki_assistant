@@ -62,6 +62,8 @@ function load(): StoredSettings {
     const stored = JSON.parse(readFileSync(settingsPath(), "utf8")) as Partial<StoredSettings>;
     // Before the camera button, "auto" took a screenshot whenever the window had little text.
     if ((stored.screenshot as string | undefined) === "auto") stored.screenshot = "button";
+    // Before the separate voices, "existentialist" blended Camus, Dostoevsky and Nietzsche.
+    if ((stored.personality as string | undefined) === "existentialist") stored.personality = "default";
     cached = { ...DEFAULTS, ...stored };
   } catch {
     cached = { ...DEFAULTS };

@@ -7,7 +7,7 @@ import type { FieldValue, FormField, TextChange, ToolResult } from "@kiki/shared
 import type { ActionStatus } from "../shared-types.ts";
 import type { EditTarget, FieldTarget, FormTarget } from "./capture/common.ts";
 import { runHelper } from "./capture/linux.ts";
-import { keepClipboard } from "./clipboard.ts";
+import { clipboardForPaste, keepClipboard } from "./clipboard.ts";
 import { focusSource, keysToSource, pasteToSource } from "./gnomeShell.ts";
 import { plural } from "./google/format.ts";
 
@@ -105,13 +105,6 @@ export function newText(text: string, changes: TextChange[]): string {
   return out;
 }
 
-/** Pastes `text` over what's selected in the source window (deletes it when `text` is empty). */
-async function pasteOver(text: string): Promise<boolean> {
-  if (!text) return keysToSource(["backspace"]);
-  await clipboard.writeText(text);
-  return pasteToSource(false);
-}
-
 async function selectThen(place: Place, how: Record<string, unknown>): Promise<SelectResult> {
   try {
     return await runHelper<SelectResult>(["--select", JSON.stringify({ ...place, ...how })], 5_000);
@@ -133,13 +126,21 @@ async function landed(pid: number, selected: SelectResult, text: string): Promis
 
 /**
  * Selects `how` (a {find}, a {start, end, expected}, or {all}) in the source window over AT-SPI and pastes
- * `text` over it. The window has to have focus first: a text field drops a selection made in the background.
+ * `text` over it (deletes it when `text` is empty). The window has to have focus first: a text field drops a
+ * selection made in the background. So `text` goes on the clipboard before that, while Kiki still has the
+ * keyboard, if it does (`kikiHasKeyboard`); after that, only the GNOME helper can put it there.
  */
-export async function selectAndPaste(place: Place, how: Record<string, unknown>, text: string): Promise<SelectResult & { pasted?: boolean }> {
+export async function selectAndPaste(
+  place: Place,
+  how: Record<string, unknown>,
+  text: string,
+  kikiHasKeyboard: boolean,
+): Promise<SelectResult & { pasted?: boolean }> {
+  if (text && !(await clipboardForPaste(text, kikiHasKeyboard))) return { ok: false, reason: "helper" };
   if (!(await focusSource())) return { ok: false, reason: "focus" };
   const selected = await selectThen(place, how);
   if (!selected.ok) return selected;
-  if (!(await pasteOver(text))) return { ...selected, ok: false, reason: "focus" };
+  if (!(await (text ? pasteToSource(false) : keysToSource(["backspace"])))) return { ...selected, ok: false, reason: "focus" };
   return { ...selected, pasted: true, ok: await landed(place.pid, selected, text) };
 }
 
@@ -151,6 +152,7 @@ const REASONS: Record<string, string> = {
   changed: "isn't there anymore",
   not_selected: "couldn't be selected",
   focus: "couldn't be reached",
+  helper: "needs Kiki's newer GNOME helper: update it in Settings, then log out and back in",
   gone: "is gone",
 };
 
@@ -195,12 +197,13 @@ export async function applyChanges(
     // The person's clipboard comes back afterwards: Kiki pasted several times through it.
     const restore = await keepClipboard();
     try {
-      for (const change of [...changes].reverse()) {
-        const result = await selectAndPaste(placeOf(target), { find: change.find }, change.replace);
+      // Only the first change starts with the keyboard on Kiki: each one hands it to the window.
+      for (const [index, change] of [...changes].reverse().entries()) {
+        const result = await selectAndPaste(placeOf(target), { find: change.find }, change.replace, index === 0);
         if (result.ok) done++;
         else if (result.pasted) failed.push(`${quote(change.find, 40)} (pasted, but Kiki couldn't confirm it)`);
         else failed.push(`${quote(change.find, 40)} (${REASONS[result.reason ?? ""] ?? "failed"})`);
-        if (result.reason === "focus") break;
+        if (result.reason === "focus" || result.reason === "helper") break;
       }
     } finally {
       await restore();
@@ -268,6 +271,8 @@ async function applyInDocs(target: EditTarget, changes: TextChange[], where: str
     throw new Error("Update Kiki's GNOME helper in Settings (then log out and back in) so Kiki can use Docs' Find and replace.");
   }
   const pid = target.pid;
+  // Saved while Kiki has the keyboard: Ctrl+H hands it to the document.
+  const restore = await keepClipboard();
   if (!(await keysToSource(["ctrl+h"]))) throw new Error(`Kiki couldn't get back to the document.`);
   const dialog = await docsDialog(pid, 3);
   const parts = dialog && docsParts(dialog);
@@ -275,7 +280,6 @@ async function applyInDocs(target: EditTarget, changes: TextChange[], where: str
     await keysToSource(["escape"]);
     throw new Error("Kiki couldn't find Docs' Find and replace. Copy the changes instead.");
   }
-  const restore = await keepClipboard();
   const failed: string[] = [];
   let done = 0;
   try {
@@ -284,7 +288,11 @@ async function applyInDocs(target: EditTarget, changes: TextChange[], where: str
     if (parts.matchCase) await press(pid, parts.matchCase, true);
     if (parts.regex && !(await press(pid, parts.regex, false))) throw new Error("Kiki couldn't turn off regular expressions in Docs.");
     for (const change of changes) {
-      const typed = await selectAndPaste(place(pid, parts.find), { all: true }, change.find);
+      const typed = await selectAndPaste(place(pid, parts.find), { all: true }, change.find, false);
+      if (typed.reason === "helper") {
+        failed.push(`${quote(change.find, 40)} (${REASONS.helper})`);
+        break;
+      }
       if (!typed.pasted) {
         failed.push(`${quote(change.find, 40)} (couldn't type it in Find)`);
         continue;
@@ -295,7 +303,7 @@ async function applyInDocs(target: EditTarget, changes: TextChange[], where: str
         failed.push(`${quote(change.find, 40)} (${matches === null ? "Docs showed no count" : `found ${plural(matches, "time")}`})`);
         continue;
       }
-      const replaced = await selectAndPaste(place(pid, parts.replace), { all: true }, change.replace);
+      const replaced = await selectAndPaste(place(pid, parts.replace), { all: true }, change.replace, false);
       if (!replaced.pasted && change.replace) {
         failed.push(`${quote(change.find, 40)} (couldn't type the replacement)`);
         continue;
@@ -342,7 +350,7 @@ export function formFields(form: FormTarget): FormField[] {
   return form.fields.map(({ path: _path, role: _role, length: _length, ...field }) => field);
 }
 
-async function fillOne(form: FormTarget, field: FieldTarget, value: string | boolean): Promise<string | null> {
+async function fillOne(form: FormTarget, field: FieldTarget, value: string | boolean, kikiHasKeyboard: boolean): Promise<string | null> {
   const where = place(form.pid, field);
   if (typeof value === "boolean") return (await press(form.pid, field, value)) ? null : "couldn't be clicked";
   if (!form.selectPaste) {
@@ -354,7 +362,7 @@ async function fillOne(form: FormTarget, field: FieldTarget, value: string | boo
     if (result.ok) return null;
     return result.reason === "changed" ? "changed since Kiki read it" : "didn't take the text";
   }
-  const result = await selectAndPaste(where, { all: true, expected: field.value ?? "" }, value);
+  const result = await selectAndPaste(where, { all: true, expected: field.value ?? "" }, value, kikiHasKeyboard);
   if (result.ok) return null;
   return result.pasted ? "pasted, but Kiki couldn't confirm it" : (REASONS[result.reason ?? ""] ?? "failed");
 }
@@ -364,11 +372,19 @@ export async function applyFill(form: FormTarget | undefined, values: FieldValue
   if (!form) throw new Error("Kiki can't fill a form in this window.");
   const restore = form.selectPaste ? await keepClipboard() : async () => {};
   const failed: string[] = [];
+  const needHelper: string[] = [];
   let done = 0;
+  // Until the first paste hands the keyboard to the window; check boxes are clicked without it.
+  let kikiHasKeyboard = true;
   try {
     for (const item of values) {
       const field = form.fields.find((candidate) => candidate.id === item.field);
-      const problem = field ? await fillOne(form, field, item.value) : "isn't on the page anymore";
+      const problem = field ? await fillOne(form, field, item.value, kikiHasKeyboard) : "isn't on the page anymore";
+      if (field && form.selectPaste && typeof item.value === "string") kikiHasKeyboard = false;
+      if (problem === REASONS.helper) {
+        needHelper.push(field!.label);
+        continue;
+      }
       if (problem) {
         failed.push(`${field?.label || item.field} (${problem})`);
         continue;
@@ -381,6 +397,7 @@ export async function applyFill(form: FormTarget | undefined, values: FieldValue
   } finally {
     await restore();
   }
+  if (needHelper.length > 0) failed.push(`${needHelper.join(", ")} (${REASONS.helper})`);
   if (done === 0) throw new Error(`Kiki couldn't fill these: ${failed.join("; ")}.`);
   return { outcome: "applied", message: summary(done, values.length, "field", "Filled", appName ? ` in ${appName}` : "", failed) };
 }

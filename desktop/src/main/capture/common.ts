@@ -78,6 +78,22 @@ export interface FormTarget {
   selectPaste: boolean;
 }
 
+/** The window the hotkey was pressed in, for scrolling it and reading it again once the popup is open. */
+export interface SourceWindow {
+  /** Where AT-SPI has it: the app's process and the window's child index. Missing when it shares no text. */
+  pid?: number;
+  window?: number[];
+  /** The app's toolkit ("gecko", "gtk"...). */
+  toolkit?: string;
+  /** A web page, which AT-SPI can scroll too. */
+  page: boolean;
+  /** Kiki's GNOME extension can scroll it (v8), and focus it and press shortcuts there (v7). */
+  wheel: boolean;
+  keys: boolean;
+  /** A screenshot of the whole window, where Kiki can take one. */
+  screenshot?: () => Promise<Screenshot | undefined>;
+}
+
 /** Everything Kiki saw when the hotkey was pressed. */
 export interface Capture {
   selection: string;
@@ -97,6 +113,8 @@ export interface Capture {
   editTarget?: EditTarget;
   /** Form fields Kiki can fill, when there are at least two. */
   form?: FormTarget;
+  /** The window itself, for scrolling it and reading what's on screen later. */
+  source?: SourceWindow;
   /** Hints for the user, e.g. how to give Kiki more context. */
   notes: string[];
 }

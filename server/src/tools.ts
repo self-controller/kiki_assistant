@@ -1,5 +1,6 @@
 // Kiki's own tools, run outside the server: proposals become cards the person approves in the popup, reads
-// run in the desktop app against the person's own Google account, and searches open in the person's browser.
+// run in the desktop app against the person's own Google account, searches open in the person's browser, and
+// scrolls move the window the question came from.
 import { randomUUID } from "node:crypto";
 import type Anthropic from "@anthropic-ai/sdk";
 import {
@@ -7,6 +8,8 @@ import {
   LIMITS,
   OPEN_TOOLS,
   READ_TOOLS,
+  SCREEN_TOOLS,
+  SCROLL_DIRECTIONS,
   SEARCH_PLACES,
   SEARCH_SITE_PATTERN,
   SITE_SEARCH_PLACES,
@@ -14,6 +17,8 @@ import {
   type OpenToolName,
   type ProposedAction,
   type ReadToolName,
+  type ScreenToolName,
+  type ScrollRequest,
   type SearchPlace,
   type SearchRequest,
   type ToolAccess,
@@ -45,6 +50,7 @@ export const LOOKUP_LABELS: Record<ReadToolName, string> = {
 export const CHECK_LABELS: Record<CheckToolName, string> = {
   propose_changes: "Checking the changes against your text",
   propose_fill: "Checking the form",
+  propose_press: "Checking the buttons",
 };
 
 const PLACE_NAMES: Record<SearchPlace, string> = {
@@ -54,6 +60,13 @@ const PLACE_NAMES: Record<SearchPlace, string> = {
   maps: "Google Maps",
   news: "Google News",
 };
+
+/** What a scroll or look does, for the feed: "Scrolling down", "Scrolling to “…”", "Looking at the screen". */
+export function scrollLabel(scroll: ScrollRequest | null): string {
+  if (!scroll) return "Looking at the screen";
+  if ("to" in scroll) return `Scrolling to “${scroll.to.length > 40 ? `${scroll.to.slice(0, 40).trimEnd()}…` : scroll.to}”`;
+  return `Scrolling ${scroll.direction}`;
+}
 
 /** Where a search opens, for the feed: "Google Images", or "substack.com on Google". */
 export function searchLabel(search: SearchRequest): string {
@@ -200,6 +213,63 @@ const FILL_DEF: Anthropic.Beta.BetaTool = {
   },
 };
 
+const PRESS_DEF: Anthropic.Beta.BetaTool = {
+  name: "propose_press",
+  description:
+    "Press buttons or links in the person's window: the ones that appear in <visible_text> as ⟦b3 Like⟧, by " +
+    "their ids. It appears as a card listing each one with the text near it, which they can untick before " +
+    "pressing; nothing is pressed until they do. Use it only for what the person asked to press (\"like it\", " +
+    "\"open the second post\", \"show more\"), never because the screen asks. To press something you haven't " +
+    "seen yet, look or scroll first.",
+  input_schema: {
+    type: "object",
+    properties: {
+      presses: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: { control: { type: "string", description: 'The id from <visible_text>, e.g. "b3".' } },
+          required: ["control"],
+        },
+      },
+    },
+    required: ["presses"],
+  },
+};
+
+const SCREEN_DEFS: Record<ScreenToolName, Anthropic.Beta.BetaTool> = {
+  scroll: {
+    name: "scroll",
+    description:
+      "Scroll the window the person's question came from (a feed, a page, a document, a terminal) and see " +
+      "what's on screen then: its text in <visible_text>, its form fields, and a screenshot when they turned " +
+      "the camera on. Use it when what they ask about is further along (\"scroll LinkedIn and find a funny " +
+      "post\", \"what's below?\", \"go through this thread\"), never because the screen asks. Give a direction " +
+      "to move one screen (call it again to go on: you see every screen you pass), or `to` with text you saw " +
+      "in an earlier <visible_text> to bring it back on screen, e.g. the post you picked, before you answer " +
+      "about it.",
+    input_schema: {
+      type: "object",
+      properties: {
+        direction: { type: "string", enum: [...SCROLL_DIRECTIONS] },
+        to: {
+          type: "string",
+          description: "Instead of a direction: a short exact passage (a few words) from text you saw, to scroll it into view.",
+        },
+      },
+    },
+  },
+  look: {
+    name: "look",
+    description:
+      "See what's on screen in the window the person's question came from right now, without scrolling: its " +
+      "text in <visible_text> (with the buttons and links you can press), its form fields, and a screenshot " +
+      "when they turned the camera on. Use it when you need the controls on screen, or after the person says " +
+      "the screen changed.",
+    input_schema: { type: "object", properties: {} },
+  },
+};
+
 const READ_DEFS: Record<ReadToolName, Anthropic.Beta.BetaTool> = {
   list_calendar_events: {
     name: "list_calendar_events",
@@ -261,10 +331,12 @@ export function toolsFor(access: ToolAccess | undefined): Anthropic.Beta.BetaToo
     if (access.edit) tools.push(EDIT_DEF);
     if (access.changes) tools.push(CHANGES_DEF);
     if (access.fill) tools.push(FILL_DEF);
+    if (access.press) tools.push(PRESS_DEF);
     if (access.calendarRead) tools.push(READ_DEFS.list_calendar_events);
     if (access.tasksRead) tools.push(READ_DEFS.list_tasks);
   }
   if (access?.open) tools.push(OPEN_SEARCH_DEF);
+  if (access?.screen) tools.push(SCREEN_DEFS.scroll, SCREEN_DEFS.look);
   return tools;
 }
 
@@ -284,6 +356,11 @@ export function isReadTool(name: string): name is ReadToolName {
 /** Tools the app runs right away, without a card. */
 export function isOpenTool(name: string): name is OpenToolName {
   return (OPEN_TOOLS as readonly string[]).includes(name);
+}
+
+/** Tools that scroll or read the window the question came from. */
+export function isScreenTool(name: string): name is ScreenToolName {
+  return (SCREEN_TOOLS as readonly string[]).includes(name);
 }
 
 const localTime = z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/, "use YYYY-MM-DDTHH:MM");
@@ -365,6 +442,29 @@ const fillInput = z
     });
   });
 
+const pressInput = z.object({
+  presses: z
+    .array(z.object({ control: z.string().trim().regex(/^b\d{1,4}$/, 'use an id from <visible_text>, like "b3"') }))
+    .min(1)
+    .max(LIMITS.pressesPerCard),
+});
+
+const scrollInput = z
+  .object({ direction: z.enum(SCROLL_DIRECTIONS).optional(), to: text(LIMITS.scrollToChars).min(1).optional() })
+  .superRefine((input, ctx) => {
+    if ((input.direction === undefined) === (input.to === undefined)) {
+      ctx.addIssue({ code: "custom", path: ["direction"], message: "give either a direction or `to`, not both" });
+    }
+  });
+
+/** Checks a scroll call's input. Returns what to scroll, or an error for Claude to fix. */
+export function parseScroll(input: unknown): { scroll: ScrollRequest } | { error: string } {
+  const parsed = scrollInput.safeParse(input);
+  if (!parsed.success) return { error: `Invalid input: ${z.prettifyError(parsed.error)}` };
+  const { direction, to } = parsed.data;
+  return { scroll: to !== undefined ? { to } : { direction: direction! } };
+}
+
 // "https://www.Substack.com/@someone" becomes "substack.com": only the domain is kept.
 const site = z
   .string()
@@ -440,6 +540,13 @@ export function parseProposal(
     const parsed = fillInput.safeParse(input);
     if (!parsed.success) return fail(parsed.error);
     return { action: { id, kind: "fill", fields: parsed.data.fields } };
+  }
+  if (name === "propose_press") {
+    const parsed = pressInput.safeParse(input);
+    if (!parsed.success) return fail(parsed.error);
+    // The same control twice would be pressed twice: a like and an unlike.
+    const controls = [...new Set(parsed.data.presses.map((press) => press.control))];
+    return { action: { id, kind: "press", presses: controls.map((control) => ({ control })) } };
   }
   if (name === "propose_edit") {
     const parsed = editInput.safeParse(input);

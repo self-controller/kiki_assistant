@@ -2,8 +2,12 @@ import type { PersonalityChoice } from "../shared-types.ts";
 
 /** The built-in personalities' prompts. The default has none: Kiki's usual voice. */
 const PRESETS: Record<Exclude<PersonalityChoice, "default" | "custom">, string> = {
-  existentialist:
-    "Speak as a voice blending Camus, Dostoevsky and Nietzsche: lucid before the absurd, feverish about conscience and suffering, aphoristic, defiant, darkly witty. Keep answers accurate and brief; let the outlook color the phrasing, ending with one sharp line.",
+  camus:
+    "Speak as Albert Camus: lucid and calm before the absurd, plain-spoken and sunlit, finding revolt, freedom and passion in a world without final answers. Keep answers accurate and brief; let the outlook color the phrasing, ending with one clear, quietly defiant line.",
+  dostoevsky:
+    "Speak as Fyodor Dostoevsky: feverish, confessional and intensely moral, wrestling aloud with conscience, suffering, faith and doubt. Keep answers accurate and brief; let the outlook color the phrasing, ending with one searching line.",
+  nietzsche:
+    "Speak as Friedrich Nietzsche: aphoristic, defiant and darkly witty, taking a hammer to comfortable values and praising self-overcoming and saying yes to life. Keep answers accurate and brief; let the outlook color the phrasing, ending with one sharp aphorism.",
 };
 
 /** The personality prompt sent with a new conversation, or undefined for Kiki's usual voice. */

@@ -178,6 +178,8 @@ export function describeAction(action: ProposedAction): string {
         .join("; ");
       return `${plural(action.fields.length, "field")}: ${list.length > 600 ? `${list.slice(0, 600)}…` : list}.`;
     }
+    case "press":
+      return `${action.presses.map((press) => `${press.control}${press.label ? ` (${clip(press.label)})` : ""}`).join(", ")}.`;
   }
 }
 
@@ -336,6 +338,14 @@ export function applyEdits(original: ProposedAction, edited: unknown): ProposedA
       });
       if (kept.length === 0) return { error: "Tick at least one field." };
       return { id: original.id, kind: "fill", fields: kept };
+    }
+    case "press": {
+      // The person can only untick what's pressed.
+      const edits: unknown[] = Array.isArray(e["presses"]) ? (e["presses"] as unknown[]) : original.presses;
+      const ticked = new Set(edits.map((item) => (item && typeof item === "object" ? (item as Record<string, unknown>)["control"] : undefined)));
+      const kept = original.presses.filter((press) => ticked.has(press.control));
+      if (kept.length === 0) return { error: "Tick at least one." };
+      return { id: original.id, kind: "press", presses: kept };
     }
   }
 }

@@ -101,7 +101,13 @@ export async function fetchMe(): Promise<TestResult> {
 export async function postToolResults(conversationId: string, results: ToolResult[]): Promise<void> {
   const conn = connection();
   if (!conn) return;
-  const body = { results: results.map((result) => ({ ...result, content: result.content.slice(0, LIMITS.toolResultChars) })) };
+  const body = {
+    results: results.map((result) => ({
+      ...result,
+      content: result.content.slice(0, LIMITS.toolResultChars),
+      ...(result.screen?.text ? { screen: { ...result.screen, text: result.screen.text.slice(0, LIMITS.screenTextChars) } } : {}),
+    })),
+  };
   try {
     await fetch(`${conn.base}/v1/conversations/${encodeURIComponent(conversationId)}/tool-results`, {
       method: "POST",

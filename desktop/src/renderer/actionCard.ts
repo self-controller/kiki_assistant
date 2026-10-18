@@ -1,5 +1,5 @@
-// Action cards: an event, task, email, edit, set of changes or form fill Kiki proposes, editable in place.
-// Nothing happens until the person presses one of its buttons.
+// Action cards: an event, task, email, edit, set of changes, form fill or presses Kiki proposes, editable in
+// place. Nothing happens until the person presses one of its buttons.
 import type { FieldValue, FormField, ProposedAction, TextChange } from "@kiki/shared";
 import type { ActionMode, ActionRunResult, ActionStatus, EditInfo, SavedAction } from "../shared-types.ts";
 import { diffParts } from "./diff.ts";
@@ -32,6 +32,7 @@ const KINDS: Record<ProposedAction["kind"], { label: string; icon: IconName }> =
   edit: { label: "Edit", icon: "pencil" },
   changes: { label: "Changes", icon: "replaceAll" },
   fill: { label: "Fill in", icon: "form" },
+  press: { label: "Press", icon: "pointerClick" },
 };
 
 type Field = HTMLInputElement | HTMLTextAreaElement;
@@ -269,6 +270,24 @@ function buildFields(
         }),
       };
     }
+    case "press": {
+      const list = el("div", "pick-list");
+      const rows = action.presses.map((press) => {
+        const content = el("span", "press-row");
+        content.append(el("span", "press-label", press.label ?? press.control));
+        // Which one: the text just before it on screen.
+        if (press.near) content.append(el("span", "press-near", `after “${press.near}”`));
+        const picked = pickRow(content);
+        list.append(picked.row);
+        return { press, tick: picked.tick };
+      });
+      const count = () => rows.filter((row) => row.tick.checked).length;
+      for (const row of rows) row.tick.addEventListener("change", () => onPick(count()));
+      return {
+        nodes: [el("div", "card-where", "Presses these in the window your question came from."), list],
+        read: () => ({ ...action, presses: rows.filter((row) => row.tick.checked).map((row) => row.press) }),
+      };
+    }
   }
 }
 
@@ -296,6 +315,7 @@ function buttonsFor(action: ProposedAction, options: CardOptions): Button[] | nu
     ];
   }
   if (action.kind === "fill") return options.fields ? [{ label: fillLabel(action.fields.length), mode: "apply", primary: true }] : [];
+  if (action.kind === "press") return [{ label: pressLabel(action.presses.length), mode: "apply", primary: true }];
   if (!options.google) {
     if (action.kind === "task") return null;
     return [{ label: action.kind === "event" ? "Open in Google Calendar" : "Open in Gmail", mode: "open", primary: true }];
@@ -320,6 +340,7 @@ function buttonsFor(action: ProposedAction, options: CardOptions): Button[] | nu
 
 const applyLabel = (count: number) => (count === 1 ? "Apply 1 change" : `Apply ${count} changes`);
 const fillLabel = (count: number) => (count === 1 ? "Fill 1 field" : `Fill ${count} fields`);
+const pressLabel = (count: number) => (count === 1 ? "Press" : `Press ${count}`);
 
 function statusLine(status: ActionStatus): HTMLElement {
   const line = el("div", `card-status ${status.outcome}`);
@@ -354,6 +375,7 @@ export function renderActionCard(saved: SavedAction, options: CardOptions): HTML
     if (!main || saved.action.kind === "edit") return;
     if (saved.action.kind === "changes" && options.edit?.changes) main.textContent = applyLabel(picked);
     if (saved.action.kind === "fill") main.textContent = fillLabel(picked);
+    if (saved.action.kind === "press") main.textContent = pressLabel(picked);
     main.disabled = picked === 0;
   };
   const { nodes, read } = buildFields(saved.action, options.edit, options.fields, onPick);
@@ -425,5 +447,7 @@ function titleOf(action: ProposedAction, fields: FormField[] | undefined): strin
     }
     case "fill":
       return action.fields.map((item) => fields?.find((field) => field.id === item.field)?.label || item.field).join(", ");
+    case "press":
+      return action.presses.map((press) => press.label ?? press.control).join(", ");
   }
 }

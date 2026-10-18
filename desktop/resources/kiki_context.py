@@ -12,7 +12,12 @@
   kiki_context.py --select JSON  Selects text to paste over: {"pid", "path", "role"} plus {"find"}, or
                                {"start", "end", "expected"}, or {"all": true}
   kiki_context.py --verify JSON  Checks that {"pid", "path", "role", "start", "text"} is there now
-  kiki_context.py --press JSON   Clicks a check box or button: {"pid", "path", "role", "checked"?}
+  kiki_context.py --press JSON   Clicks a check box, button or link: {"pid", "path", "role", "checked"?, "name"?}
+  kiki_context.py --check-presses JSON  Whether each of {"pid", "controls": [{"path", "role", "name"}]} is still
+                               there to press
+  kiki_context.py --screen JSON  What's on screen now in the window an earlier read found: {"pid", "window"}
+  kiki_context.py --scroll JSON  Scrolls a page there over AT-SPI, then reads the screen: {"pid", "window"} plus
+                               {"direction": "down" | "up"} or {"to": text on the page}
   kiki_context.py --docs-dialog JSON  Google Docs' Find and replace dialog in the app with {"pid"}
   kiki_context.py --screenshot Full-screen screenshot via the XDG desktop portal
   kiki_context.py --delay 3    Wait first (for testing: highlight text, then switch windows)
@@ -36,6 +41,9 @@ from gi.repository import Atspi, Gio, GLib  # noqa: E402
 EMBEDDED_OBJECT = "￼"
 # Marks where on-screen text starts while a page is read; never in the output.
 ON_SCREEN = "\ue000"
+# Where a control is in a screen read's text: CONTROL_START, its index in "controls", CONTROL_LABEL, its label,
+# CONTROL_END. Kiki turns each into "⟦b3 Like⟧".
+CONTROL_START, CONTROL_LABEL, CONTROL_END = "\ue001", "\ue002", "\ue003"
 # Roles that start a new line when their text is joined with siblings'.
 BLOCK_ROLES = {
     Atspi.Role.PARAGRAPH,
@@ -84,6 +92,23 @@ TEXT_FIELD_ROLES = {Atspi.Role.ENTRY, Atspi.Role.TEXT}
 TOGGLE_ROLES = {Atspi.Role.CHECK_BOX, Atspi.Role.RADIO_BUTTON}
 MAX_FIELDS = 40
 FIELD_VALUE_CHARS = 200
+# What a press card can press on screen: buttons, links, tabs. Check boxes and radio buttons are fields.
+CONTROL_ROLES = {
+    Atspi.Role.PUSH_BUTTON,
+    Atspi.Role.BUTTON,
+    Atspi.Role.TOGGLE_BUTTON,
+    Atspi.Role.LINK,
+    Atspi.Role.MENU_ITEM,
+    Atspi.Role.PAGE_TAB,
+}
+MAX_CONTROLS = 300
+# A control's label, at most; a control holding more text (a link around a whole post) keeps its text.
+CONTROL_LABEL_CHARS = 120
+WINDOW_ROLES = {Atspi.Role.FRAME, Atspi.Role.WINDOW, Atspi.Role.DIALOG}
+# Where a page scrolls the text it brings back into view: this far below the window's top, below a sticky header.
+SCROLL_TO_Y = 200
+# Where a page scrolls the last line on screen when it moves down a screen, so it shows again at the top.
+NEXT_SCREEN_Y = 120
 
 
 class Budget:
@@ -99,6 +124,9 @@ class Budget:
         self.focused_editable = None
         # Fields a form fill could set, in reading order; see note_field().
         self.fields = []
+        # A screen read (read_screen()): only what's on screen, and the controls there to press, in reading order.
+        self.screen_only = False
+        self.controls = None
 
     def exhausted(self):
         return self.chars_left <= 0 or self.nodes_left <= 0 or time.monotonic() > self.deadline
@@ -168,6 +196,10 @@ def collect(obj, budget, depth=0, path=()):
     states = safe(obj.get_state_set)
     if role in SKIP_ROLES or not visible_states(states):
         return ""
+    showing = states is None or states.contains(Atspi.StateType.SHOWING)
+    # Browsers clear "showing" on what's scrolled out of view, and so on everything inside it.
+    if budget.screen_only and not showing:
+        return ""
     if (
         budget.focused_editable is None
         and states is not None
@@ -177,7 +209,14 @@ def collect(obj, budget, depth=0, path=()):
         budget.focused_editable = obj
     if role in TEXT_FIELD_ROLES or role in TOGGLE_ROLES:
         note_field(obj, role, states, path, budget)
+    text = collect_text(obj, role, states, budget, depth, path)
+    if budget.controls is not None and role in CONTROL_ROLES and len(budget.controls) < MAX_CONTROLS:
+        return control_marker(obj, role, text, path, budget)
+    return text
 
+
+def collect_text(obj, role, states, budget, depth, path):
+    """collect()'s text for obj: its own, with its children's spliced in, or else its children's joined."""
     text = own_text(obj, budget)
     if text is None:
         # No text of its own: join the children's text.
@@ -190,10 +229,13 @@ def collect(obj, budget, depth=0, path=()):
                 break
         return "\n".join(parts)
 
+    multi_line = states is not None and states.contains(Atspi.StateType.MULTI_LINE)
+    if budget.screen_only and role in EDITOR_ROLES and multi_line and EMBEDDED_OBJECT not in text:
+        text = visible_lines(obj, text)
     own = text.replace(EMBEDDED_OBJECT, "")
     budget.chars_left -= len(own)
     # Browsers clear "showing" on what is scrolled out of view.
-    if own.strip() and states is not None and states.contains(Atspi.StateType.SHOWING):
+    if not budget.screen_only and own.strip() and states is not None and states.contains(Atspi.StateType.SHOWING):
         # Ahead of the children's text, so the markers come in the order of budget.on_screen.
         text = ON_SCREEN + text
         budget.on_screen.append(len(own))
@@ -211,6 +253,49 @@ def collect(obj, budget, depth=0, path=()):
             out.append(piece)
         return "".join(out)
     return text
+
+
+def control_label(obj):
+    """What a control says: its name, on one line and cut to CONTROL_LABEL_CHARS. Empty without one."""
+    return " ".join((safe(obj.get_name) or "").split())[:CONTROL_LABEL_CHARS]
+
+
+def control_marker(obj, role, text, path, budget):
+    """Notes a control a press card could press, and marks it in the text in place of its own words.
+
+    Only controls with a name: the card has to say what it presses. A control around a lot of text (a link
+    around a whole post) keeps that text after its marker.
+    """
+    label = control_label(obj)
+    if not label:
+        return text
+    inner = " ".join(text.replace(EMBEDDED_OBJECT, " ").split())
+    budget.controls.append({"path": list(path), "role": safe(obj.get_role_name), "name": label})
+    marker = f"{CONTROL_START}{len(budget.controls) - 1}{CONTROL_LABEL}{label}{CONTROL_END}"
+    if len(inner) <= CONTROL_LABEL_CHARS:
+        # Links and buttons in running text stay in their line.
+        return marker if role == Atspi.Role.LINK else f" {marker} "
+    return f"{marker}\n{text}"
+
+
+def visible_lines(obj, text):
+    """The whole lines of a long text object (an editor) that are on screen, from the offsets at its corners.
+
+    All of `text` when the toolkit can't say.
+    """
+    iface = safe(obj.get_text_iface)
+    component = safe(obj.get_component_iface)
+    extents = safe(lambda: Atspi.Component.get_extents(component, Atspi.CoordType.WINDOW)) if component else None
+    if iface is None or extents is None or extents.width <= 2 or extents.height <= 2:
+        return text
+    at = lambda x, y: safe(lambda: Atspi.Text.get_offset_at_point(iface, x, y, Atspi.CoordType.WINDOW), -1)  # noqa: E731
+    start = at(extents.x + 1, extents.y + 1)
+    end = at(extents.x + extents.width - 2, extents.y + extents.height - 2)
+    if start is None or end is None or start < 0 or end <= start or end > len(text):
+        return text
+    start = text.rfind("\n", 0, start) + 1
+    stop = text.find("\n", end)
+    return text[start : len(text) if stop < 0 else stop]
 
 
 def note_field(obj, role, states, path, budget):
@@ -557,6 +642,8 @@ def read_window(app, window, max_chars, max_seconds):
         "windowTitle": safe(window.get_name),
         "pid": safe(app.get_process_id),
         "toolkit": toolkit_of(app),
+        # So --screen and --scroll can find this window again once Kiki's popup is the active one.
+        "window": path_from_app(window),
     }
     anchor = find_text_anchor(window, max_seconds / 2)
     target = anchor_target(app, anchor)
@@ -905,18 +992,44 @@ def verify_text(request):
     return {"ok": True} if wait_for(there) else {"ok": False, "reason": "not_there"}
 
 
-ACTION_NAMES = ("click", "press", "toggle", "activate", "check", "uncheck")
+ACTION_NAMES = ("click", "press", "jump", "toggle", "activate", "check", "uncheck")
+
+
+def press_check(request):
+    """The control a press request leads to and its Action interface, or a reason it can't be pressed.
+
+    With "name" (a control from a screen read), the control there must still say the same: a feed that loaded
+    more posts can have put another one at its path.
+    """
+    obj = target_of(request)
+    if obj is None:
+        return None, None, "gone"
+    if request.get("name") and control_label(obj) != request["name"]:
+        return None, None, "moved"
+    action = safe(obj.get_action_iface)
+    if action is None or not (safe(lambda: Atspi.Action.get_n_actions(action), 0) or 0):
+        return None, None, "no_action"
+    return obj, action, None
+
+
+def check_presses(request):
+    """Whether each control in request["controls"] can still be pressed: "ok", "gone", "moved" or "no_action"."""
+    pid = request["pid"]
+    results = []
+    for control in request["controls"]:
+        _obj, _action, reason = press_check({**control, "pid": pid})
+        results.append(reason or "ok")
+    return {"ok": True, "results": results}
 
 
 def press(request):
-    """Clicks the target (a check box, radio button or button) through its action.
+    """Clicks the target (a check box, radio button, button or link) through its action.
 
     With "checked", only when its state differs, and it checks the state changed.
     """
-    obj = target_of(request)
-    action = safe(obj.get_action_iface) if obj is not None else None
-    if action is None:
-        return {"ok": False, "reason": "gone" if obj is None else "no_action"}
+    obj, action, reason = press_check(request)
+    if reason:
+        return {"ok": False, "reason": reason}
     want = request.get("checked")
     is_checked = lambda: has_state(obj, Atspi.StateType.CHECKED)  # noqa: E731
     if want is not None and is_checked() == want:
@@ -928,6 +1041,167 @@ def press(request):
     if want is not None and not wait_for(lambda: is_checked() == want):
         return {"ok": False, "reason": "failed"}
     return {"ok": True, "changed": True}
+
+
+def find_source(pid, window_path):
+    """The app with `pid` and its window an earlier read found (its child index), or the one showing a page
+    when that index no longer leads to a window. (None, None) when the app is gone.
+    """
+    app = next((a for a in children(Atspi.get_desktop(0)) if safe(a.get_process_id) == pid), None)
+    if app is None:
+        return None, None
+    window = app
+    for index in window_path or []:
+        window = safe(lambda: window.get_child_at_index(index)) if window is not None else None
+    if window is None or window is app or safe(window.get_role) not in WINDOW_ROLES:
+        showing = [w for w in children(app) if has_state(w, Atspi.StateType.SHOWING)]
+        window = next((w for w in showing if find_document(w) is not None), showing[0] if showing else None)
+    return app, window
+
+
+def read_screen(app, window, max_chars=150_000, max_seconds=3):
+    """What's on screen in the window now: its title, its text on screen with markers where controls are
+    (see control_marker()), those controls and the form fields on screen, with paths from the app.
+    """
+    budget = Budget(max_chars, max_seconds, max_nodes=20_000)
+    budget.screen_only = True
+    budget.controls = []
+    document = find_document(window)
+    root = document or window
+    text = normalize(collect(root, budget))
+    result = {"windowTitle": safe(window.get_name), "text": text, "truncated": budget.exhausted(), "controls": [], "fields": []}
+    url = document_url(document) if document is not None else None
+    if url:
+        result["url"] = url
+    base = path_from_app(root)
+    if base is not None:
+        result["controls"] = [{**control, "path": base + control["path"]} for control in budget.controls]
+        result["fields"] = [{**field, "path": base + field["path"]} for field in budget.fields]
+    else:
+        # Controls Kiki can't find again can't be pressed: only their labels stay.
+        result["text"] = re.sub(f"{CONTROL_START}\\d+{CONTROL_LABEL}([^{CONTROL_END}]*){CONTROL_END}", r"\1", text)
+    return result
+
+
+def screen(request):
+    """read_screen() for the window an earlier read found."""
+    app, window = find_source(int(request["pid"]), request.get("window"))
+    if window is None:
+        return {"ok": False, "reason": "gone"}
+    return {"ok": True, **read_screen(app, window)}
+
+
+def text_nodes(root, budget, depth=0, out=None):
+    """The objects under root with text of their own, in reading order: (node, own text, showing)."""
+    out = [] if out is None else out
+    if budget.exhausted() or depth > 60:
+        return out
+    budget.nodes_left -= 1
+    role = safe(root.get_role)
+    if role in SKIP_ROLES or not is_visible(root):
+        return out
+    iface = safe(root.get_text_iface)
+    if iface is not None:
+        count = safe(lambda: Atspi.Text.get_character_count(iface), 0) or 0
+        own = (safe(lambda: Atspi.Text.get_text(iface, 0, min(count, 20_000)), "") or "").replace(EMBEDDED_OBJECT, " ")
+        if own.strip():
+            out.append((root, own, has_state(root, Atspi.StateType.SHOWING)))
+    for child in children(root):
+        text_nodes(child, budget, depth + 1, out)
+    return out
+
+
+def squash(text):
+    return " ".join(text.split()).casefold()
+
+
+def find_text(nodes, wanted):
+    """The node whose own text holds `wanted` (ignoring case and spacing) nearest what's on screen, or None.
+
+    Falls back to the passage's first words: it may run on into a link, which is a node of its own.
+    """
+    shown = [index for index, (_node, _text, showing) in enumerate(nodes) if showing]
+    words = squash(wanted).split()
+    for count in (len(words), 8, 5, 3):
+        if count > len(words) or count < min(3, len(words)):
+            continue
+        needle = " ".join(words[:count])
+        matches = [index for index, (_node, text, _showing) in enumerate(nodes) if needle in squash(text)]
+        if matches:
+            near = lambda index: min((abs(index - s) for s in shown), default=0)  # noqa: E731
+            return nodes[min(matches, key=near)][0]
+    return None
+
+
+def top_of(node):
+    """Where node's top is in its window now, or None."""
+    component = safe(node.get_component_iface)
+    extents = safe(lambda: Atspi.Component.get_extents(component, Atspi.CoordType.WINDOW)) if component else None
+    return (extents.x, extents.y) if extents is not None and extents.height > 0 else None
+
+
+def scroll_node(node, y=None, edge=None):
+    """Scrolls the page so node's top is at `y` in the window, or node sits at `edge`. Whether it moved."""
+    component = safe(node.get_component_iface)
+    before = top_of(node)
+    if component is None or before is None:
+        return False
+    if edge is not None:
+        asked = safe(lambda: Atspi.Component.scroll_to(component, edge), False)
+    else:
+        asked = safe(lambda: Atspi.Component.scroll_to_point(component, Atspi.CoordType.WINDOW, before[0], y), False)
+        if not asked:
+            asked = safe(lambda: Atspi.Component.scroll_to(component, Atspi.ScrollType.TOP_EDGE), False)
+    return bool(asked) and wait_for(lambda: top_of(node) != before, 1.0)
+
+
+def screen_step(root, direction):
+    """Scrolls a page by about a screen over AT-SPI: the last line on screen to near the top, or the first to
+    the bottom. It goes by the longest run of text on screen, which leaves sticky headers and sidebars out.
+    """
+    nodes = text_nodes(root, Budget(400_000, 2, max_nodes=20_000))
+    runs, current = [], []
+    for node, text, showing in nodes:
+        if showing:
+            current.append((node, len(text)))
+        elif current:
+            runs.append(current)
+            current = []
+    if current:
+        runs.append(current)
+    if not runs:
+        return False
+    run = max(runs, key=lambda r: sum(length for _node, length in r))
+    if direction == "down":
+        return scroll_node(run[-1][0], y=NEXT_SCREEN_Y)
+    return scroll_node(run[0][0], edge=Atspi.ScrollType.BOTTOM_EDGE)
+
+
+def scroll(request):
+    """Scrolls a page in the window an earlier read found, over AT-SPI, then reads the screen: a screen
+    (direction "down" or "up"), or until the text "to" is near the top. Firefox only scrolls a window that's
+    on screen, not one hidden behind others.
+
+    Returns read_screen() plus "moved", or {"ok": false, "reason"}: "gone", "not_found" (no such text), or
+    "not_moved" (the app didn't scroll; "y" says where the text is, for scrolling another way).
+    """
+    app, window = find_source(int(request["pid"]), request.get("window"))
+    if window is None:
+        return {"ok": False, "reason": "gone"}
+    root = find_document(window) or window
+    if "to" in request:
+        node = find_text(text_nodes(root, Budget(400_000, 3, max_nodes=30_000)), request["to"])
+        if node is None:
+            return {"ok": False, "reason": "not_found"}
+        if not scroll_node(node, y=SCROLL_TO_Y):
+            # Already where it should be, or the app doesn't scroll over AT-SPI.
+            at = top_of(node)
+            if not has_state(node, Atspi.StateType.SHOWING) or at is None or at[1] < 0:
+                return {"ok": False, "reason": "not_moved", **({"y": at[1]} if at else {})}
+        moved = True
+    else:
+        moved = screen_step(root, request.get("direction", "down"))
+    return {"ok": True, "moved": moved, **read_screen(app, window)}
 
 
 COUNT_PATTERN = re.compile(r"\b(\d+)\s+of\s+(\d+)\b|\bno results\b", re.IGNORECASE)
@@ -1072,6 +1346,9 @@ def main():
     parser.add_argument("--select", metavar="JSON")
     parser.add_argument("--verify", metavar="JSON")
     parser.add_argument("--press", metavar="JSON")
+    parser.add_argument("--check-presses", metavar="JSON")
+    parser.add_argument("--screen", metavar="JSON")
+    parser.add_argument("--scroll", metavar="JSON")
     parser.add_argument("--docs-dialog", metavar="JSON")
     parser.add_argument("--delay", type=float, default=0)
     parser.add_argument("--max-chars", type=int, default=150_000)
@@ -1096,6 +1373,12 @@ def main():
             output = verify_text(json.loads(args.verify))
         elif args.press:
             output = press(json.loads(args.press))
+        elif args.check_presses:
+            output = check_presses(json.loads(args.check_presses))
+        elif args.screen:
+            output = screen(json.loads(args.screen))
+        elif args.scroll:
+            output = scroll(json.loads(args.scroll))
         elif args.docs_dialog:
             output = docs_dialog(json.loads(args.docs_dialog))
         else:

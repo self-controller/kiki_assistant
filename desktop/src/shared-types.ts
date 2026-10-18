@@ -16,7 +16,7 @@ import type {
 export type ScreenshotPolicy = "button" | "always" | "never";
 
 /** How Kiki talks: its usual voice, a built-in personality, or the person's own prompt. */
-export type PersonalityChoice = "default" | "existentialist" | "custom";
+export type PersonalityChoice = "default" | "camus" | "dostoevsky" | "nietzsche" | "custom";
 
 /** What the popup shows before the first question. */
 export interface PopupInit {
@@ -166,6 +166,8 @@ export type PopupEvent =
   | { type: "notice"; message: string }
   /** The window's text changed: its slower full read finished. */
   | { type: "context"; textChars: number; textPreview?: string }
+  /** Fill cards can set more fields now: a scroll found them on screen. */
+  | { type: "fields"; fields: FormField[] }
   /** Sent last for every ask, on the same channel as the stream, so it always arrives in order. */
   | { type: "end" };
 

@@ -6,23 +6,27 @@
 // PasteToSource focuses that window again and types the paste shortcut, for Kiki's edit cards in apps
 // that don't take text over accessibility. FocusSource only focuses it (Kiki then selects the text a change
 // replaces, over accessibility, and pastes), and KeysToSource presses a few allowed shortcuts there, such as
-// Ctrl+H for Google Docs' Find and replace.
+// Ctrl+H for Google Docs' Find and replace. ScrollSource scrolls it with a virtual mouse wheel, without taking
+// the focus from Kiki, for Kiki's scroll tool. SetClipboard puts text on the clipboard for those pastes: GNOME
+// drops a clipboard write from an app without the keyboard, and Kiki hands the keyboard to that window.
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
+import St from 'gi://St';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import {cropAround} from './crop.js';
 import {insideHitRect, popupGeometry} from './placement.js';
+import {inside, scrollPoint} from './scroll.js';
 
 Gio._promisify(Shell.Screenshot, 'composite_to_stream');
 
-const VERSION = 7;
+const VERSION = 9;
 const OBJECT_PATH = '/app/kiki/Shell';
 /** How long after PlacePopup the next window from that process counts as the popup. */
 const EXPECT_US = 5 * GLib.USEC_PER_SEC;
@@ -75,6 +79,17 @@ const INTERFACE = `<node>
       <arg type="u" direction="out" name="version"/>
       <arg type="b" direction="out" name="done"/>
     </method>
+    <method name="SetClipboard">
+      <arg type="s" direction="in" name="text"/>
+      <arg type="u" direction="out" name="version"/>
+      <arg type="b" direction="out" name="done"/>
+    </method>
+    <method name="ScrollSource">
+      <arg type="i" direction="in" name="percent"/>
+      <arg type="i" direction="in" name="pixels"/>
+      <arg type="u" direction="out" name="version"/>
+      <arg type="s" direction="out" name="outcome"/>
+    </method>
     <method name="Version">
       <arg type="u" direction="out" name="version"/>
     </method>
@@ -83,6 +98,9 @@ const INTERFACE = `<node>
 
 /** How often a popup that lets clicks through checks the pointer, besides when the cursor tracker says it moved. */
 const POINTER_POLL_MS = 100;
+
+/** Longest text SetClipboard takes, in characters. */
+const MAX_CLIPBOARD = 1_000_000;
 
 /** Largest crop CaptureSource takes, in logical pixels. */
 const MAX_CROP = 4096;
@@ -93,6 +111,18 @@ const KEY_SETTLE_MS = 60;
 const KEY_GAP_MS = 15;
 /** Time for the app to act on one shortcut (open a dialog, move the cursor) before the next. */
 const STEP_GAP_MS = 120;
+
+/** Mutter hands apps 10 pixels for each 1.0 of a smooth scroll. */
+const PIXELS_PER_SCROLL = 10;
+/** ScrollSource scrolls in pieces this big, this far apart, like a quick flick on a touchpad. */
+const SCROLL_PIECE_PX = 80;
+const SCROLL_GAP_MS = 10;
+/** Time for the window to see the pointer arrive before the scroll does. */
+const POINTER_SETTLE_MS = 40;
+/** Pause before the scroll's end, so apps see it stopped and don't carry it on (kinetic scrolling). */
+const SCROLL_STOP_MS = 150;
+/** The most one ScrollSource moves: about ten screens. */
+const MAX_SCROLL_PX = 20000;
 
 /**
  * The shortcuts KeysToSource presses, by name. Only these: whatever calls it can't type text, which goes
@@ -158,6 +188,11 @@ class Popup {
 
     get hasHitRect() {
         return this._hit !== null;
+    }
+
+    /** Whether the popup takes the pointer at `point`: over its chat box, or anywhere without a hit rect. */
+    takes(point) {
+        return !this._hit || insideHitRect(point, rectOf(this._window.get_frame_rect()), this._hit);
     }
 
     setHitRect(rect) {
@@ -244,6 +279,8 @@ export default class KikiExtension extends Extension {
             PasteToSourceAsync: (params, invocation) => this._pasteToSource(params, invocation),
             FocusSourceAsync: (params, invocation) => this._reply(invocation, () => this._focusSource()),
             KeysToSourceAsync: ([steps], invocation) => this._reply(invocation, () => this._keysToSource(steps)),
+            ScrollSourceAsync: (params, invocation) => this._scrollSourceCall(params, invocation),
+            SetClipboard: text => [VERSION, this._setClipboard(text)],
             Version: () => VERSION,
         });
         this._service.export(Gio.DBus.session, OBJECT_PATH);
@@ -255,6 +292,8 @@ export default class KikiExtension extends Extension {
         this._forgetSource();
         this._keyboard?.run_dispose();
         this._keyboard = null;
+        this._pointer?.run_dispose();
+        this._pointer = null;
         global.display.disconnectObject(this);
         for (const popup of [...this._popups])
             popup.destroy();
@@ -441,6 +480,108 @@ export default class KikiExtension extends Extension {
                 await sleep(KEY_GAP_MS);
             }
         }
+    }
+
+    /** Puts `text` on the clipboard, whichever window has the keyboard. */
+    _setClipboard(text) {
+        if (text.length > MAX_CLIPBOARD)
+            return false;
+        St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, text);
+        return true;
+    }
+
+    async _scrollSourceCall([percent, pixels], invocation) {
+        try {
+            const outcome = await this._scrollSource(percent, pixels);
+            invocation.return_value(new GLib.Variant('(us)', [VERSION, outcome]));
+        } catch (e) {
+            invocation.return_dbus_error('org.freedesktop.DBus.Error.Failed', `${e}`);
+        }
+    }
+
+    /**
+     * Scrolls the remembered window by `percent` of its height plus `pixels` (down when positive), with a
+     * virtual touchpad. Scrolls go to the window under the pointer, so the pointer moves onto the window for
+     * a moment, hidden, and goes back. The focus stays where it is, so Kiki's popup keeps the keyboard.
+     *
+     * Returns "scrolled", or why not: "gone" (the window closed), "hidden" (minimized or on another
+     * workspace), "busy" (the overview or a dialog of the shell's is open), "covered" (other windows are over
+     * all of it).
+     */
+    async _scrollSource(percent, pixels) {
+        const window = this._source?.window;
+        if (!window)
+            return 'gone';
+        const workspace = global.workspace_manager.get_active_workspace();
+        if (window.minimized || !window.located_on_workspace(workspace))
+            return 'hidden';
+        if (Main.overview.visible || Main.modalCount > 0)
+            return 'busy';
+        const frame = rectOf(window.get_frame_rect());
+        const point = scrollPoint(frame, spot => this._reaches(window, spot));
+        if (!point)
+            return 'covered';
+        const total = Math.max(-MAX_SCROLL_PX, Math.min(Math.round(frame.height * percent / 100) + pixels, MAX_SCROLL_PX));
+        if (total === 0)
+            return 'scrolled';
+
+        this._pointer ??= Clutter.get_default_backend().get_default_seat()
+            .create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
+        const [startX, startY] = global.get_pointer();
+        const tracker = global.backend?.get_cursor_tracker?.();
+        const visible = tracker?.get_pointer_visible?.() ?? true;
+        try {
+            tracker?.set_pointer_visible?.(false);
+            this._pointer.notify_absolute_motion(GLib.get_monotonic_time(), point.x, point.y);
+            this._updatePopups();
+            await sleep(POINTER_SETTLE_MS);
+            for (let left = total; left !== 0;) {
+                const piece = Math.sign(left) * Math.min(Math.abs(left), SCROLL_PIECE_PX);
+                this._pointer.notify_scroll_continuous(
+                    GLib.get_monotonic_time(), 0, piece / PIXELS_PER_SCROLL,
+                    Clutter.ScrollSource.FINGER, Clutter.ScrollFinishFlags.NONE);
+                left -= piece;
+                await sleep(SCROLL_GAP_MS);
+            }
+            await sleep(SCROLL_STOP_MS);
+            this._pointer.notify_scroll_continuous(
+                GLib.get_monotonic_time(), 0, 0, Clutter.ScrollSource.FINGER, Clutter.ScrollFinishFlags.VERTICAL);
+        } finally {
+            // Back where it was, unless the person moved it meanwhile.
+            const [x, y] = global.get_pointer();
+            if (Math.abs(x - point.x) <= 1 && Math.abs(y - point.y) <= 1)
+                this._pointer.notify_absolute_motion(GLib.get_monotonic_time(), startX, startY);
+            tracker?.set_pointer_visible?.(visible);
+            this._updatePopups();
+        }
+        return 'scrolled';
+    }
+
+    /**
+     * Whether a scroll at `point` would reach `window`: it's the top window there, or only Kiki's popups are
+     * above it there, away from their chat box (where they let the pointer through).
+     */
+    _reaches(window, point) {
+        const workspace = global.workspace_manager.get_active_workspace();
+        const windows = global.get_window_actors()
+            .map(actor => actor.meta_window)
+            .filter(other => other && other.showing_on_its_workspace() && other.located_on_workspace(workspace));
+        for (const other of global.display.sort_windows_by_stacking(windows).reverse()) {
+            if (!inside(point, rectOf(other.get_frame_rect())))
+                continue;
+            if (other === window)
+                return true;
+            const popup = [...this._popups].find(p => p.window === other);
+            if (!popup || popup.takes(point))
+                return false;
+        }
+        return false;
+    }
+
+    /** Has each popup take the pointer, or let it through, for where the pointer is now. */
+    _updatePopups() {
+        for (const popup of this._popups ?? [])
+            popup.updatePointer();
     }
 
     async _captureSource([maxWidth, maxHeight], invocation) {

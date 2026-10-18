@@ -106,3 +106,49 @@ export async function captureSource(maxWidth: number, maxHeight: number): Promis
     return null;
   }
 }
+
+/** The extension version that has `setClipboard`. */
+export const CLIPBOARD_VERSION = 9;
+
+/** `text` as a GVariant string in gdbus's text format: quoted, with backslashes, quotes and control characters escaped. */
+export function gvariantString(text: string): string {
+  const escaped = text.replace(/[\\'\u0000-\u001f\u007f]/g, (char) =>
+    char === "\\" || char === "'" ? `\\${char}` : `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+  return `'${escaped}'`;
+}
+
+/**
+ * Puts `text` on the clipboard from the shell. GNOME drops a clipboard write from an app that doesn't have
+ * the keyboard, but the shell can write it whichever window does. False without version 9 of the extension.
+ */
+export async function setClipboard(text: string): Promise<boolean> {
+  try {
+    // "(uint32 9, true)"
+    return (await callExtension(2_000, "SetClipboard", gvariantString(text))).includes("true");
+  } catch {
+    return false;
+  }
+}
+
+/** The extension version that has `scrollSource`. */
+export const SCROLL_VERSION = 8;
+
+/** What `scrollSource` did: scrolled, or why not (see the extension's ScrollSource). */
+export const SCROLL_OUTCOMES = ["scrolled", "gone", "hidden", "busy", "covered"] as const;
+export type ScrollOutcome = (typeof SCROLL_OUTCOMES)[number];
+
+/**
+ * Scrolls the window `rememberSource` saw by `percent` of its height plus `pixels` (down when positive), with
+ * a virtual touchpad over it; the focus stays with Kiki. Null when the extension can't.
+ */
+export async function scrollSource(percent: number, pixels: number): Promise<ScrollOutcome | null> {
+  try {
+    // "(uint32 8, 'scrolled')". Typed, so gdbus doesn't take a negative number for an option.
+    const out = await callExtension(5_000, "ScrollSource", `int32 ${Math.round(percent)}`, `int32 ${Math.round(pixels)}`);
+    const outcome = out.match(/'([a-z]+)'/)?.[1];
+    return (SCROLL_OUTCOMES as readonly string[]).includes(outcome ?? "") ? (outcome as ScrollOutcome) : null;
+  } catch {
+    return null;
+  }
+}

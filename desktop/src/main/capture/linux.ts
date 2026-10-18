@@ -7,13 +7,14 @@ import { app, clipboard, nativeImage } from "electron";
 import type { Screenshot } from "@kiki/shared";
 import type { ScreenshotPolicy } from "../../shared-types.ts";
 import type { FieldKind } from "@kiki/shared";
-import { captureSource, KEYS_VERSION, PASTE_VERSION, rememberSource } from "../gnomeShell.ts";
+import { captureSource, KEYS_VERSION, PASTE_VERSION, rememberSource, SCROLL_VERSION } from "../gnomeShell.ts";
 import {
   toScreenshot,
   type EditTarget,
   type FormTarget,
   type PageText,
   type RawCapture,
+  type SourceWindow,
   type Vicinity,
 } from "./common.ts";
 
@@ -21,6 +22,8 @@ const run = promisify(execFile);
 
 /** The most of the focused window to send as a screenshot, in logical pixels: the strip around the pointer. */
 const CROP = { width: 1400, height: 700 };
+/** Screenshots while scrolling take the whole window (the extension's largest crop). */
+const WHOLE_WINDOW = { width: 4096, height: 4096 };
 /**
  * Reading a long web page over accessibility takes a couple of seconds. The quick read stops early so
  * the popup opens at once; the full read starts with it (while the source window is still active) and
@@ -48,13 +51,15 @@ interface HelperContext {
   /** The app's process and toolkit ("gtk", "gecko", "chromium"...). */
   pid?: number | null;
   toolkit?: string;
+  /** The window's child index in its app, for reading it again later. */
+  window?: number[] | null;
   /** A browser page's address. */
   url?: string;
   /** Fields a form fill could set, when the page or window has at least two. */
   fields?: HelperField[];
 }
 
-interface HelperField {
+export interface HelperField {
   path: number[];
   role?: string | null;
   label: string;
@@ -149,9 +154,9 @@ async function takeImage(path: string, area: Screenshot["area"]): Promise<Screen
  * The window the hotkey was pressed in, around the pointer, from Kiki's GNOME extension: no permission
  * prompt, no file left behind, and Kiki's popup doesn't show even when it's open on top.
  */
-async function sourceScreenshot(): Promise<ScreenshotResult> {
-  const path = await captureSource(CROP.width, CROP.height);
-  const screenshot = path ? await takeImage(path, "pointer").catch(() => undefined) : undefined;
+async function sourceScreenshot(size = CROP): Promise<ScreenshotResult> {
+  const path = await captureSource(size.width, size.height);
+  const screenshot = path ? await takeImage(path, size === CROP ? "pointer" : undefined).catch(() => undefined) : undefined;
   return screenshot ? { screenshot } : { error: "the GNOME helper couldn't take a screenshot" };
 }
 
@@ -170,7 +175,7 @@ async function portalScreenshot(): Promise<ScreenshotResult> {
  * Toolkits whose AT-SPI text writes do nothing (Firefox and Zen: verified) or aren't known to work (Chromium,
  * Electron). Kiki selects the text there over AT-SPI and pastes over it.
  */
-const SELECT_PASTE_TOOLKITS = new Set(["gecko", "chromium"]);
+export const SELECT_PASTE_TOOLKITS = new Set(["gecko", "chromium"]);
 const GOOGLE_DOC = /^https:\/\/docs\.google\.com\/document\/d\//;
 
 /**
@@ -247,6 +252,29 @@ export function linuxForm(context: HelperContext, keysReady: boolean): FormTarge
   };
 }
 
+/**
+ * The window the hotkey was pressed in, for Kiki's scroll and look tools: where AT-SPI has it (to read it again
+ * and, for pages, to scroll it), and whether the GNOME extension remembered it (to scroll any app, v8, and to
+ * take screenshots unless Settings says never). Undefined when Kiki can do neither.
+ */
+export function linuxSource(
+  context: HelperContext,
+  version: number | null,
+  screenshot?: () => Promise<Screenshot | undefined>,
+): SourceWindow | undefined {
+  const readable = context.ok && context.pid && context.window && context.source !== "none";
+  const wheel = version !== null && version >= SCROLL_VERSION;
+  if (!readable && !wheel && !screenshot) return undefined;
+  return {
+    ...(readable ? { pid: context.pid!, window: context.window! } : {}),
+    ...(context.toolkit ? { toolkit: context.toolkit } : {}),
+    page: Boolean(readable && context.source === "document"),
+    wheel,
+    keys: version !== null && version >= KEYS_VERSION,
+    ...(screenshot ? { screenshot } : {}),
+  };
+}
+
 async function readContext(
   read: { seconds: number; timeoutMs: number },
   signal?: AbortSignal,
@@ -307,6 +335,11 @@ export async function captureLinux(policy: ScreenshotPolicy): Promise<RawCapture
   const version = sourceVersion ?? 0;
   const editTarget = linuxEditTarget(context, selection, version >= PASTE_VERSION, version >= KEYS_VERSION);
   const form = linuxForm(context, version >= KEYS_VERSION);
+  const source = linuxSource(
+    context,
+    sourceVersion,
+    sourceKnown ? async () => (await sourceScreenshot(WHOLE_WINDOW)).screenshot : undefined,
+  );
   return {
     selection,
     appName: context.appName ?? undefined,
@@ -319,6 +352,7 @@ export async function captureLinux(policy: ScreenshotPolicy): Promise<RawCapture
     takeScreenshot: sourceKnown ? async () => (await sourceScreenshot()).screenshot : undefined,
     ...(editTarget ? { editTarget } : {}),
     ...(form ? { form } : {}),
+    ...(source ? { source } : {}),
     notes,
   };
 }

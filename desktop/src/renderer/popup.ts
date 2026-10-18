@@ -612,6 +612,9 @@ function handleEvent(event: PopupEvent): void {
     case "context":
       setTextChip(event.textChars, event.textPreview);
       break;
+    case "fields":
+      formFields = event.fields;
+      break;
   }
 }
 

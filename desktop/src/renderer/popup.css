@@ -1104,6 +1104,29 @@ html.popup-page body {
   white-space: nowrap;
 }
 
+.press-row {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+}
+
+.press-label {
+  color: var(--k-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.press-near {
+  color: var(--k-faint);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .card-fields input:focus,
 .card-fields textarea:focus {
   border-color: var(--k-violet);

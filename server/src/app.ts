@@ -26,7 +26,7 @@ import { z } from "zod";
 import { classifyError, MODEL_IDS, runTurn, type ClaudeConfig } from "./claude.ts";
 import type { CodeRecord, CodeStore } from "./codes.ts";
 import type { Conversation, ConversationStore } from "./conversations.ts";
-import { buildConversationStart, buildFollowUpMessage } from "./prompt.ts";
+import { buildConversationStart, buildFollowUpMessage, withoutScreenshots } from "./prompt.ts";
 import { audioExtension, SttError, transcribe, type SttConfig } from "./stt.ts";
 
 export interface AppDeps {
@@ -77,6 +77,8 @@ const toolsSchema = z
     changes: z.enum(CHANGES_MODES).optional(),
     fill: z.boolean().optional(),
     open: z.boolean().optional(),
+    screen: z.boolean().optional(),
+    press: z.boolean().optional(),
   })
   .optional();
 
@@ -91,7 +93,7 @@ const outcomesSchema = z
   .array(
     z.object({
       id: z.string().min(1).max(100),
-      kind: z.enum(["event", "task", "email", "edit", "changes", "fill"]),
+      kind: z.enum(["event", "task", "email", "edit", "changes", "fill", "press"]),
       outcome: z.enum(ACTION_OUTCOMES),
       summary: z.string().max(1_000),
     }),
@@ -102,6 +104,19 @@ const outcomesSchema = z
 /** What every question can carry besides its text and images. */
 const questionExtras = { tools: toolsSchema, clock: clockSchema, actionOutcomes: outcomesSchema };
 
+const fieldsSchema = z
+  .array(
+    z.object({
+      id: z.string().regex(/^f\d{1,3}$/),
+      label: z.string().max(LIMITS.fieldLabelChars),
+      kind: z.enum(FIELD_KINDS),
+      value: z.string().max(LIMITS.fieldValueChars).optional(),
+      checked: z.boolean().optional(),
+    }),
+  )
+  .max(LIMITS.formFields)
+  .optional();
+
 const toolResultsSchema = z.object({
   results: z
     .array(
@@ -109,6 +124,15 @@ const toolResultsSchema = z.object({
         id: z.string().min(1).max(200),
         content: z.string().max(LIMITS.toolResultChars),
         isError: z.boolean().optional(),
+        screen: z
+          .object({
+            windowTitle: z.string().max(LIMITS.windowTitleChars).optional(),
+            text: z.string().max(LIMITS.screenTextChars).optional(),
+            fields: fieldsSchema,
+            screenshot: screenshotSchema.optional(),
+            atEnd: z.boolean().optional(),
+          })
+          .optional(),
       }),
     )
     .min(1)
@@ -126,18 +150,7 @@ const startSchema = z.object({
     editable: z
       .object({ text: z.string().max(LIMITS.editableChars), truncated: z.boolean().optional() })
       .optional(),
-    fields: z
-      .array(
-        z.object({
-          id: z.string().regex(/^f\d{1,3}$/),
-          label: z.string().max(LIMITS.fieldLabelChars),
-          kind: z.enum(FIELD_KINDS),
-          value: z.string().max(LIMITS.fieldValueChars).optional(),
-          checked: z.boolean().optional(),
-        }),
-      )
-      .max(LIMITS.formFields)
-      .optional(),
+    fields: fieldsSchema,
   }),
   images: imagesSchema,
   options: optionsSchema,
@@ -312,7 +325,8 @@ export function createApp(deps: AppDeps) {
           log(`[kiki] ${record.name}: refused ${stats}`);
           send({ type: "error", code: "refused", message: "Kiki can't help with this one." });
         } else {
-          conversation.messages.push(...result.messages);
+          // Screenshots from scrolling stay with the turn that took them; follow-ups don't send them again.
+          conversation.messages.push(...withoutScreenshots(result.messages));
           log(`[kiki] ${record.name}: ${result.stopReason} ${stats}`);
           if (result.sources.length > 0) send({ type: "sources", items: result.sources });
           send({ type: "done", stopReason: result.stopReason });

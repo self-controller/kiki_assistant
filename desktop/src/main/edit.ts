@@ -7,6 +7,7 @@ import type { EditTarget } from "./capture/common.ts";
 import { runHelper } from "./capture/linux.ts";
 import { pasteIntoApp } from "./capture/mac.ts";
 import { selectAndPaste } from "./changes.ts";
+import { clipboardForPaste } from "./clipboard.ts";
 import { pasteToSource } from "./gnomeShell.ts";
 
 interface HelperEditResult {
@@ -84,11 +85,15 @@ export async function applyEdit(
   }
   const where = appName ? ` in ${appName}` : "";
 
+  // GNOME drops a clipboard write from Kiki once it has handed the keyboard to the window it pastes into.
+  let kikiHasKeyboard = true;
+  let onClipboard = false;
   // Firefox and Zen take no AT-SPI writes: select the original there, and paste over it.
   if (target.atspi && target.selectPaste) {
     const { pid, path, role, start, end } = target.atspi;
     const message = target.mode === "replace" ? `Replaced${where}.` : `Inserted${where}.`;
-    const result = await selectAndPaste({ pid, path, ...(role ? { role } : {}) }, { start, end, expected: target.original }, text);
+    const place = { pid, path, ...(role ? { role } : {}) };
+    const result = await selectAndPaste(place, { start, end, expected: target.original }, text, true);
     if (result.pasted) {
       const written = result.start !== undefined ? { start: result.start, end: result.start + text.length } : undefined;
       retarget(target, text, written);
@@ -98,6 +103,9 @@ export async function applyEdit(
       throw new Error("The text changed since Kiki read it. Highlight it again and ask, or copy this.");
     }
     console.warn("[kiki] select and paste:", result.reason);
+    // It put the text on the clipboard first, then focused the window: the paste below uses that.
+    kikiHasKeyboard = false;
+    onClipboard = Boolean(text);
   } else if (target.atspi) {
     const result = await writeOverAtspi(target, text);
     if (result.ok) {
@@ -115,7 +123,9 @@ export async function applyEdit(
 
   // A trailing newline would run a terminal command as it's pasted.
   const terminal = target.kind === "terminal";
-  await clipboard.writeText(terminal ? text.replace(/\n+$/, "") : text);
+  if (!onClipboard && !(await clipboardForPaste(terminal ? text.replace(/\n+$/, "") : text, kikiHasKeyboard))) {
+    throw new Error(`Kiki couldn't paste there. Copy this and paste it with ${PASTE_KEYS}.`);
+  }
   const pasted = target.macPid ? await pasteIntoApp(target.macPid) : target.paste ? await pasteToSource(terminal) : false;
   if (!pasted) {
     throw new Error(`Kiki couldn't get back to ${appName ?? "the window"}. It's on your clipboard: paste it with ${PASTE_KEYS}.`);

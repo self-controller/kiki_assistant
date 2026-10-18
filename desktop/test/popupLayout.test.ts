@@ -5,6 +5,7 @@ import {
   INSETS,
   popupGeometry,
 } from "../resources/gnome-extension/kiki-popup@kiki.app/placement.js";
+import { inside, scrollPoint } from "../resources/gnome-extension/kiki-popup@kiki.app/scroll.js";
 import { formatSeconds, paragraphs, thoughtLine } from "../src/renderer/feed.ts";
 import { POPUP_WIDTH, springStep, type Spring } from "../src/renderer/layout.ts";
 
@@ -160,5 +161,24 @@ describe("popup click-through", () => {
     expect(insideHitRect({ x: 105, y: 400 }, frame, hit)).toBe(false);
     // Outside the window.
     expect(insideHitRect({ x: 20, y: 400 }, frame, hit)).toBe(false);
+  });
+});
+
+describe("scrollPoint", () => {
+  const window = { x: 100, y: 50, width: 1000, height: 800 };
+
+  it("scrolls in the middle of the window, a little below center", () => {
+    expect(scrollPoint(window, () => true)).toEqual({ x: 600, y: 490 });
+  });
+
+  it("goes around Kiki's chat box (or another window) covering the middle", () => {
+    const chatBox = { x: 450, y: 350, width: 400, height: 320 };
+    const point = scrollPoint(window, (p) => !inside(p, chatBox));
+    expect(point).toEqual({ x: 600, y: 330 });
+    expect(inside(point!, window)).toBe(true);
+  });
+
+  it("gives up when nothing of the window can be reached", () => {
+    expect(scrollPoint(window, () => false)).toBeNull();
   });
 });

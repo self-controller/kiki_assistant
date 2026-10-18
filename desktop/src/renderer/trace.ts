@@ -1,18 +1,28 @@
-// The "Thinking…" feed above an answer: what Kiki thinks, searches, reads and opens while it works,
+// The "Thinking…" feed above an answer: what Kiki thinks, searches, reads, opens and scrolls while it works,
 // collapsing to one line ("Thought for 6s · 2 searches · 5 sources") once the answer starts.
 import type { Activity, Source } from "@kiki/shared";
 import { formatSeconds, hostOf, paragraphs, plural, thoughtLine } from "./feed.ts";
-import { icon } from "./icons.ts";
+import { icon, type IconName } from "./icons.ts";
 import { SwapText } from "./textfx.ts";
 
 /** What Kiki is doing right now, as the feed's title says it. */
-export type TracePhase = "thinking" | "searching" | "reading";
+export type TracePhase = "thinking" | "searching" | "reading" | "scrolling";
 
 const PHASE_TITLES: Record<TracePhase, string> = {
   thinking: "Thinking…",
   searching: "Searching the web…",
   reading: "Reading…",
+  scrolling: "Scrolling…",
 };
+
+/** The icon for a lookup or check line, by what it checks. */
+function lookupIcon(label: string): IconName {
+  if (label.includes("task")) return "listTodo";
+  if (label.includes("button")) return "pointerClick";
+  if (label.includes("form")) return "form";
+  if (label.includes("changes")) return "replaceAll";
+  return "calendar";
+}
 
 /** Feed lines shown while Kiki works; older ones fold into "+N earlier". */
 const VISIBLE_LINES = 5;
@@ -39,6 +49,8 @@ export class Trace {
   readonly #reads = new Map<string, HTMLLIElement>();
   readonly #queries = new Set<string>();
   readonly #hosts = new Set<string>();
+  /** Scrolls of the person's window, for the summary. */
+  #scrolls = 0;
   #thinking = "";
   #paragraphs = 0;
   #frame = 0;
@@ -105,7 +117,7 @@ export class Trace {
         this.#addRead(activity.url, activity.title);
         break;
       case "lookup": {
-        const line = this.#line("lookup", icon(activity.label.includes("task") ? "listTodo" : "calendar", 12));
+        const line = this.#line("lookup", icon(lookupIcon(activity.label), 12));
         line.append(el("span", "line-text", activity.label));
         this.onChange();
         break;
@@ -115,6 +127,17 @@ export class Trace {
         const text = el("span", "line-text", `Opening ${activity.label} for `);
         text.append(el("q", undefined, activity.query));
         line.append(text);
+        this.onChange();
+        break;
+      }
+      case "scroll": {
+        const looking = !activity.label.startsWith("Scrolling");
+        if (!looking) {
+          this.#scrolls++;
+          this.setPhase("scrolling");
+        }
+        const line = this.#line("scroll", icon(looking ? "eye" : "mouse", 12));
+        line.append(el("span", "line-text", activity.label));
         this.onChange();
         break;
       }
@@ -233,6 +256,7 @@ export class Trace {
     const stats = [
       searches > 0 ? plural(searches, "search", "searches") : null,
       this.#hosts.size > 0 ? plural(this.#hosts.size, "source") : null,
+      this.#scrolls > 0 ? plural(this.#scrolls, "scroll") : null,
     ].filter(Boolean);
     this.#meta.textContent = stats.length > 0 ? `· ${stats.join(" · ")}` : "";
     if (this.#thinking.trim()) this.#full.textContent = this.#thinking.trim();

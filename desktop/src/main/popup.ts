@@ -4,6 +4,7 @@ import {
   type FieldValue,
   type FollowUpRequest,
   type KikiEvent,
+  type PressTarget,
   type ProposedAction,
   type Screenshot,
   type Source,
@@ -53,6 +54,16 @@ import { applyEdits, currentClock } from "./google/format.ts";
 import { googleAccount } from "./google/oauth.ts";
 import { expectPopup, movePopup, placePopup, setHitRect } from "./linuxSetup.ts";
 import { personalityPrompt } from "./personalities.ts";
+import {
+  applyPresses,
+  describePresses,
+  newScreenState,
+  pressProblems,
+  runScreenTool,
+  screenTools,
+  type ScreenAccess,
+  type ScreenState,
+} from "./screen.ts";
 import { openSearch } from "./search.ts";
 import { getAccessCode, getSettings } from "./settings.ts";
 import { createPopupWindow, isMac, isWayland, openExternal } from "./windows.ts";
@@ -77,6 +88,10 @@ interface PopupSession {
   actions: Map<string, SavedAction>;
   /** What the person did with cards since the last question, for Claude to hear with the next one. */
   outcomes: ActionOutcome[];
+  /** What scrolls and looks read in the window: the controls they gave ids to. */
+  screen: ScreenState;
+  /** What the person lets scrolls and looks send for the question being answered. */
+  look: ScreenAccess;
 }
 
 const sessions = new Map<number, PopupSession>();
@@ -121,6 +136,8 @@ export async function openPopup(openSettings: () => void): Promise<void> {
     hitRect: { latest: null, sending: false },
     actions: new Map(),
     outcomes: [],
+    screen: newScreenState(),
+    look: { text: false, window: false, screenshot: false },
   });
   window.on("closed", () => {
     sessions.get(id)?.abort?.abort();
@@ -334,8 +351,12 @@ async function ask(session: PopupSession, options: AskOptions): Promise<void> {
     }
     if (event.type === "tool_call") {
       const conversationId = pendingId;
-      if (conversationId) void runAppTool(session, event).then((result) => postToolResults(conversationId, [result]));
+      if (conversationId) void runAppTool(session, event, send).then((result) => postToolResults(conversationId, [result]));
       return;
+    }
+    if (event.type === "action" && event.action.kind === "press") {
+      // The card says what Kiki read on those controls, not what Claude called them.
+      event.action.presses = describePresses(event.action.presses, session.screen);
     }
     if (event.type === "action") {
       const saved: SavedAction = { action: event.action };
@@ -371,6 +392,13 @@ async function ask(session: PopupSession, options: AskOptions): Promise<void> {
 
   try {
     const google = googleAccount().connected;
+    const omitted = session.conversationId ? session.omit : options.omit;
+    session.look = {
+      text: !omitted.text,
+      window: !omitted.window,
+      // The camera: on when it took a screenshot and the person didn't turn it off for this question.
+      screenshot: Boolean(session.capture.screenshot) && !options.omit.screenshot,
+    };
     const turn: FollowUpRequest = {
       question: options.question.trim(),
       ...(options.images?.length ? { images: options.images } : {}),
@@ -381,6 +409,7 @@ async function ask(session: PopupSession, options: AskOptions): Promise<void> {
         calendarRead: google,
         tasksRead: google,
         ...writeTools(session.capture, session.conversationId ? session.omit.text : options.omit.text),
+        ...screenTools(session.capture, session.look),
       },
       clock: currentClock(),
       ...(outcomes.length ? { actionOutcomes: outcomes.slice(-LIMITS.actionOutcomes) } : {}),
@@ -438,12 +467,26 @@ function writeTools(capture: Capture, omitText: boolean | undefined): Partial<To
 }
 
 /**
- * Runs a tool Claude called for the app: a read, a check of changes or a fill against the window now, or a
- * search to open in the browser.
+ * Runs a tool Claude called for the app: a read, a check of changes, a fill or presses against the window now,
+ * a search to open in the browser, or a scroll or look in the window.
  */
-async function runAppTool(session: PopupSession, call: Extract<KikiEvent, { type: "tool_call" }>): Promise<ToolResult> {
+async function runAppTool(
+  session: PopupSession,
+  call: Extract<KikiEvent, { type: "tool_call" }>,
+  send: (event: PopupEvent) => void,
+): Promise<ToolResult> {
   if (call.name === "open_search") return openSearch(call.id, call.input);
   const list = <T>(key: string) => (Array.isArray(call.input[key]) ? (call.input[key] as T[]) : []);
+  if (call.name === "scroll" || call.name === "look") {
+    const result = await runScreenTool(session.capture, session.screen, call, session.look, session.abort?.signal);
+    // Fields that scrolled into view can be filled: fill cards need their labels.
+    if (result.screen?.fields && session.capture.form) send({ type: "fields", fields: formFields(session.capture.form) });
+    return result;
+  }
+  if (call.name === "propose_press") {
+    const problems = await pressProblems(session.capture.source, session.screen, list<PressTarget>("presses"));
+    return problems ? { id: call.id, content: problems, isError: true } : { id: call.id, content: "All of them can be pressed." };
+  }
   if (call.name === "propose_changes") {
     return { id: call.id, ...(await checkChanges(session.capture.editTarget, list<TextChange>("changes"))) };
   }
@@ -458,13 +501,14 @@ async function runAppTool(session: PopupSession, call: Extract<KikiEvent, { type
 function fitsCard(kind: ProposedAction["kind"], mode: ActionMode): boolean {
   if (mode === "dismiss") return true;
   if (kind === "edit" || kind === "changes") return mode === "apply" || mode === "copy";
-  if (kind === "fill") return mode === "apply";
+  if (kind === "fill" || kind === "press") return mode === "apply";
   return mode !== "apply" && mode !== "copy";
 }
 
 /** Runs a card's button in the window the question came from, or with Google. */
-function runButton(capture: Capture, action: ProposedAction, mode: ActionMode): Promise<ActionStatus> {
-  if (mode === "dismiss" && (action.kind === "changes" || action.kind === "fill")) {
+function runButton(session: PopupSession, action: ProposedAction, mode: ActionMode): Promise<ActionStatus> {
+  const { capture } = session;
+  if (mode === "dismiss" && (action.kind === "changes" || action.kind === "fill" || action.kind === "press")) {
     return Promise.resolve({ outcome: "dismissed", message: "Dismissed." });
   }
   switch (action.kind) {
@@ -474,6 +518,8 @@ function runButton(capture: Capture, action: ProposedAction, mode: ActionMode): 
       return applyChanges(capture.editTarget, action.changes, mode === "copy" ? "copy" : "apply", capture.appName);
     case "fill":
       return applyFill(capture.form, action.fields, capture.appName);
+    case "press":
+      return applyPresses(capture.source, session.screen, action.presses, capture.appName);
     default:
       return runAction(action, mode);
   }
@@ -487,7 +533,7 @@ async function runCard(session: PopupSession, id: string, edited: unknown, mode:
   const action = mode === "dismiss" ? saved.action : applyEdits(saved.action, edited);
   if ("error" in action) return { ok: false, message: action.error };
   try {
-    saved.status = await runButton(session.capture, action, mode);
+    saved.status = await runButton(session, action, mode);
     saved.action = action;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -573,6 +619,7 @@ export function registerPopupIpc(openSettings: () => void): void {
     session.screenshotSent = true;
     session.actions = new Map(entry.turns.flatMap((turn) => turn.actions ?? []).map((saved) => [saved.action.id, saved]));
     session.outcomes = [];
+    session.screen = newScreenState();
     return {
       id: entry.id,
       appName: entry.context.appName,

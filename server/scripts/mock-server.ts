@@ -4,7 +4,9 @@
 // Every answer "thinks" first; questions mentioning "latest" or "search" (or sent with the Search toggle)
 // get a fake web search and page read. Voice questions get a canned transcript. Questions about the
 // calendar, reminders or email get action cards; "am I free" checks the calendar through the app. "typos"
-// proposes changes to the text at the cursor (upper-casing a few words), and "fill" fills the form.
+// proposes changes to the text at the cursor (upper-casing a few words), and "fill" fills the form. "scroll"
+// scrolls down three screens, then back to what it saw on the second; "like" or "press" looks at the screen and
+// proposes pressing its first button.
 import Anthropic from "@anthropic-ai/sdk";
 import { serve } from "@hono/node-server";
 import { createApp } from "../src/app.ts";
@@ -31,11 +33,80 @@ function tag(text: string, name: string): string | undefined {
   return new RegExp(`<${name}>\\n([\\s\\S]*?)\\n</${name}>`).exec(text)?.[1];
 }
 
+/** A tool result's text: a string, or the text blocks of a scroll's result (next to its screenshot). */
+function resultText(content: unknown): string {
+  if (!Array.isArray(content)) return String(content ?? "");
+  return (content as Array<{ type: string; text?: string }>).flatMap((b) => (b.type === "text" ? [b.text ?? ""] : [])).join("\n");
+}
+
 /** The tool results the app (or the server, for cards) sent back, if the last message is one. */
 function toolResults(body: { messages: Array<{ role: string; content: unknown }> }): string[] {
   const last = body.messages.at(-1);
   const blocks = Array.isArray(last?.content) ? (last.content as Array<{ type: string; content?: unknown }>) : [];
-  return blocks.filter((b) => b.type === "tool_result").map((b) => String(b.content ?? ""));
+  return blocks.filter((b) => b.type === "tool_result").map((b) => resultText(b.content));
+}
+
+/** The tools Claude called since the person's last question, oldest first. */
+function turnToolCalls(body: { messages: Array<{ role: string; content: unknown }> }): Array<{ name: string; input: Record<string, unknown> }> {
+  const asked = body.messages.findLastIndex(
+    (m) => m.role === "user" && !(Array.isArray(m.content) && (m.content as Array<{ type: string }>).some((b) => b.type === "tool_result")),
+  );
+  return body.messages.slice(asked + 1).flatMap((m) =>
+    m.role === "assistant" && Array.isArray(m.content)
+      ? (m.content as Array<{ type: string; name?: string; input?: Record<string, unknown> }>)
+          .filter((b) => b.type === "tool_use")
+          .map((b) => ({ name: b.name ?? "", input: b.input ?? {} }))
+      : [],
+  );
+}
+
+/** The question this turn answers, from the person's last message. */
+function turnQuestion(body: { messages: Array<{ role: string; content: unknown }> }): string {
+  const asked = body.messages.findLast(
+    (m) => m.role === "user" && !(Array.isArray(m.content) && (m.content as Array<{ type: string }>).some((b) => b.type === "tool_result")),
+  );
+  const text = asked ? lastUserText({ messages: [asked] }) : "";
+  return tag(text, "question") ?? text;
+}
+
+/**
+ * Scrolls through the window: three screens down, then back to a line from the second screen, then the answer.
+ * Presses: a look, then a card for the first button on screen. Null once the question needs neither.
+ */
+function screenTurn(body: Parameters<typeof answerFor>[0], tools: string[]): FakeTurn | null {
+  const question = turnQuestion(body);
+  const calls = turnToolCalls(body);
+  const seen = toolResults(body).join("\n");
+  const use = (name: string, input: Record<string, unknown>): FakeTurn => ({
+    stopReason: "tool_use",
+    blocks: [
+      { type: "text", text: name === "scroll" ? "Let me scroll a bit further." : "Let me look at the screen." },
+      { type: "tool_use", name, input },
+    ],
+  });
+  if (/like|press/i.test(question) && tools.includes("look") && tools.includes("propose_press")) {
+    if (calls.length === 0) return use("look", {});
+    const button = /⟦(b\d+)/.exec(seen)?.[1];
+    if (calls.length === 1 && button) return use("propose_press", { presses: [{ control: button }] });
+    return null;
+  }
+  if (!/scroll|further down|go through/i.test(question) || !tools.includes("scroll")) return null;
+  const scrolls = calls.filter((call) => call.name === "scroll").length;
+  if (scrolls < 3) return use("scroll", { direction: "down" });
+  if (scrolls === 3) {
+    // A line from the second screen, which the third scroll moved past.
+    const screens = body.messages.flatMap((m) =>
+      m.role === "user" && Array.isArray(m.content)
+        ? (m.content as Array<{ type: string; content?: unknown }>).filter((b) => b.type === "tool_result").map((b) => resultText(b.content))
+        : [],
+    );
+    const line = tag(screens.at(-2) ?? "", "visible_text")
+      ?.split("\n")
+      .map((l) => l.replace(/⟦[^⟧]*⟧/g, "").trim())
+      .find((l) => l.length > 12);
+    if (line) return use("scroll", { to: line.slice(0, 60) });
+  }
+  return null;
 }
 
 /** A few changes to `text`: up to three words that appear once in it, upper-cased. */
@@ -140,6 +211,8 @@ function answerFor(body: {
   output_config?: { effort?: string };
   tools?: Array<{ name: string }>;
 }): FakeTurn {
+  const screen = screenTurn(body, (body.tools ?? []).map((tool) => tool.name));
+  if (screen) return screen;
   const results = toolResults(body);
   if (results.length > 0) {
     return { blocks: [{ type: "text", text: `**Mock answer** after Kiki's tools.\n\n> ${results.join("\n> ").slice(0, 400)}` }] };

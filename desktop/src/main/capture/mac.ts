@@ -6,7 +6,7 @@ import { keepClipboard } from "../clipboard.ts";
 import { toScreenshot, type EditTarget, type RawCapture } from "./common.ts";
 
 // NOTE: written against the macOS Accessibility and System Events APIs but not yet
-// tested on a Mac. See the README's macOS checklist.
+// tested on a Mac. See the macOS checklist in hidden_README.md.
 
 const run = promisify(execFile);
 

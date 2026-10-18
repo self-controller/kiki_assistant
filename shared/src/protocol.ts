@@ -39,6 +39,13 @@ export const LIMITS = {
   fillValueChars: 2_000,
   /** What `open_search` may search for. */
   searchQueryChars: 500,
+  /** The text on screen that one `scroll` or `look` sends back. */
+  screenTextChars: 12_000,
+  /** How long the text `scroll` brings back into view may be. */
+  scrollToChars: 300,
+  /** Buttons and links on one press card, and how much of each one's name and the text before it the card shows. */
+  pressesPerCard: 10,
+  controlLabelChars: 120,
 } as const;
 
 export type ScreenshotMediaType = "image/jpeg" | "image/png";
@@ -125,6 +132,13 @@ export interface ToolAccess {
   fill?: boolean;
   /** The app can open a search in a new tab of the person's browser (`open_search`). */
   open?: boolean;
+  /**
+   * The app can scroll the window the question came from and read what's on screen then (`scroll`, `look`):
+   * its text, and a screenshot when the person turned the camera on.
+   */
+  screen?: boolean;
+  /** The app can press the buttons and links it read on screen (`propose_press`). */
+  press?: boolean;
 }
 
 /** Where `open_search` searches. The app builds each URL itself, so it only ever opens one of these. */
@@ -147,6 +161,36 @@ export type EditMode = (typeof EDIT_MODES)[number];
 
 export const CHANGES_MODES = ["text", "docs"] as const;
 export type ChangesMode = (typeof CHANGES_MODES)[number];
+
+export const SCROLL_DIRECTIONS = ["down", "up"] as const;
+export type ScrollDirection = (typeof SCROLL_DIRECTIONS)[number];
+
+/**
+ * What `scroll` does: move a screen (one at a time, so Claude sees everything it passes), or bring text Claude
+ * saw back into view.
+ */
+export type ScrollRequest = { direction: ScrollDirection } | { to: string };
+
+/** What a `scroll` or `look` saw in the window afterwards. */
+export interface ScreenRead {
+  windowTitle?: string;
+  /** The text on screen now, with "⟦b3 Like⟧" where a button or link Kiki can press is. */
+  text?: string;
+  /** Form fields on screen now, by id; ids carry over from earlier reads. */
+  fields?: FormField[];
+  /** The window, when the person turned the camera on. */
+  screenshot?: Screenshot;
+  /** Scrolling moved nothing: that's as far as the window scrolls that way. */
+  atEnd?: boolean;
+}
+
+/** A button or link to press, by its id in the text on screen ("b3"). */
+export interface PressTarget {
+  control: string;
+  /** Filled in by the app from what it read, for the card: the control's name, and the text just before it. */
+  label?: string;
+  near?: string;
+}
 
 /** One change in a text: its one occurrence of `find` becomes `replace`. */
 export interface TextChange {
@@ -200,11 +244,13 @@ export type ProposedAction =
   /** Changes in several places in the text the cursor is in. */
   | { id: string; kind: "changes"; changes: TextChange[] }
   /** Values for form fields, by the ids in `context.fields`. */
-  | { id: string; kind: "fill"; fields: FieldValue[] };
+  | { id: string; kind: "fill"; fields: FieldValue[] }
+  /** Buttons or links to press in the person's window. */
+  | { id: string; kind: "press"; presses: PressTarget[] };
 
 export type ActionKind = ProposedAction["kind"];
 
-export const ACTION_OUTCOMES = ["added", "drafted", "sent", "opened", "applied", "copied", "dismissed", "failed"] as const;
+export const ACTION_OUTCOMES = ["added", "drafted", "sent", "opened", "applied", "copied", "pressed", "dismissed", "failed"] as const;
 export type ActionOutcomeKind = (typeof ACTION_OUTCOMES)[number];
 
 /** What the person did with an action card, reported with their next question. */
@@ -261,6 +307,8 @@ export interface ToolResult {
   /** Plain text (or JSON) for Claude to read. */
   content: string;
   isError?: boolean;
+  /** For `scroll` and `look`: what's on screen now. */
+  screen?: ScreenRead;
 }
 
 /** The read tools the app runs for Kiki. */
@@ -271,15 +319,19 @@ export type ReadToolName = (typeof READ_TOOLS)[number];
  * Proposals the app checks before they become cards, against the text or form as it is now: its result is
  * an error for Claude to fix (e.g. a change whose text appears twice), or anything else to go ahead.
  */
-export const CHECK_TOOLS = ["propose_changes", "propose_fill"] as const;
+export const CHECK_TOOLS = ["propose_changes", "propose_fill", "propose_press"] as const;
 export type CheckToolName = (typeof CHECK_TOOLS)[number];
 
 /** Tools the app runs right away, without a card: opening a search in the person's browser. */
 export const OPEN_TOOLS = ["open_search"] as const;
 export type OpenToolName = (typeof OPEN_TOOLS)[number];
 
+/** Tools that move or read the window the question came from, without a card. */
+export const SCREEN_TOOLS = ["scroll", "look"] as const;
+export type ScreenToolName = (typeof SCREEN_TOOLS)[number];
+
 /** The tools the app runs during a turn (`tool_call` events). */
-export type AppToolName = ReadToolName | CheckToolName | OpenToolName;
+export type AppToolName = ReadToolName | CheckToolName | OpenToolName | ScreenToolName;
 
 /** GET /v1/me */
 export interface MeResponse {
@@ -327,7 +379,9 @@ export type Activity =
   /** Kiki is looking something up in the person's accounts, e.g. "Checking your calendar". */
   | { kind: "lookup"; label: string }
   /** Kiki is opening a search in the person's browser; `label` is where, e.g. "Google Images". */
-  | { kind: "open"; label: string; query: string };
+  | { kind: "open"; label: string; query: string }
+  /** Kiki is scrolling the person's window or looking at it, e.g. "Scrolling down". */
+  | { kind: "scroll"; label: string };
 
 export type KikiEvent =
   | { type: "conversation"; id: string }

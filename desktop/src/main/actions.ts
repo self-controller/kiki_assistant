@@ -15,8 +15,11 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** The cards that go to Google (or open a Google page); edit cards run in edit.ts, changes and fills in changes.ts. */
-export type GoogleAction = Exclude<ProposedAction, { kind: "edit" | "changes" | "fill" }>;
+/**
+ * The cards that go to Google (or open a Google page); edit cards run in edit.ts, changes and fills in
+ * changes.ts, presses in screen.ts.
+ */
+export type GoogleAction = Exclude<ProposedAction, { kind: "edit" | "changes" | "fill" | "press" }>;
 
 /** Runs one button on a card. Throws with a message for the card when it fails. */
 export async function runAction(action: GoogleAction, mode: ActionMode): Promise<ActionStatus> {
@@ -47,7 +50,7 @@ export function outcomeFor(action: ProposedAction, status: ActionStatus): Action
     status.outcome === "failed"
       ? `Error: ${status.message}`
       : // Where the text went (replaced, inserted or pasted), or how much of it, matters for the next edit.
-        action.kind === "edit" || action.kind === "changes" || action.kind === "fill"
+        action.kind === "edit" || action.kind === "changes" || action.kind === "fill" || action.kind === "press"
         ? `${status.message} ${describeAction(action)}`
         : describeAction(action);
   return { id: action.id, kind: action.kind, outcome: status.outcome, summary: summary.slice(0, 1_000) };

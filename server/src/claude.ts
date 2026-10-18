@@ -11,17 +11,20 @@ import type {
   ToolResult,
 } from "@kiki/shared";
 import type { UsageDelta } from "./codes.ts";
-import { systemPrompt } from "./prompt.ts";
+import { screenBlocks, systemPrompt } from "./prompt.ts";
 import {
   CHECK_LABELS,
   isCheckTool,
   isOpenTool,
   isProposalTool,
   isReadTool,
+  isScreenTool,
   LOOKUP_LABELS,
   parseProposal,
+  parseScroll,
   parseSearch,
   PROPOSAL_ACK,
+  scrollLabel,
   searchLabel,
   toolsFor,
 } from "./tools.ts";
@@ -64,6 +67,8 @@ const FALLBACK_BETA = "server-side-fallback-2026-07-01";
 const MAX_PAUSE_RESUMES = 3;
 /** Rounds of Kiki's own tools (cards and lookups) per answer; after that Claude must answer. */
 const MAX_TOOL_ROUNDS = 4;
+/** Scrolls and looks per answer. Rounds of only those don't count as tool rounds, while there are steps left. */
+export const MAX_SCREEN_STEPS = 15;
 const MAX_UNCITED_SOURCES = 5;
 const MAX_RESULTS_SHOWN = 5;
 // Keeps a fetched page to roughly the size of the nearby text we already send.
@@ -182,6 +187,7 @@ export async function runTurn(options: {
   const system = systemPrompt(options.personality);
   let pauses = 0;
   let toolRounds = 0;
+  const screen = { steps: 0 };
   /** Answer text the current response has streamed. */
   let responseChars = 0;
   const sources = new SourceCollector();
@@ -235,7 +241,7 @@ export async function runTurn(options: {
         setPhase("writing");
       } else if (
         block.type === "tool_use" &&
-        (isProposalTool(block.name) || isReadTool(block.name) || isOpenTool(block.name))
+        (isProposalTool(block.name) || isReadTool(block.name) || isOpenTool(block.name) || isScreenTool(block.name))
       ) {
         // What Claude wrote before using a tool was notes on its way there, not the answer.
         if (responseChars > 0) {
@@ -294,8 +300,10 @@ export async function runTurn(options: {
     // A long server-side search loop pauses; resend the turn as-is to let it continue.
     if (message.stop_reason === "pause_turn" && pauses++ < MAX_PAUSE_RESUMES) continue;
     if (message.stop_reason === "tool_use") {
-      toolRounds++;
-      messages.push({ role: "user", content: await runKikiTools(message.content, emit, options.callTool) });
+      // Scrolling through a window takes many rounds; they don't use up the ones for cards and lookups.
+      const uses = message.content.filter((block) => block.type === "tool_use");
+      if (!(uses.every((block) => isScreenTool(block.name)) && screen.steps < MAX_SCREEN_STEPS)) toolRounds++;
+      messages.push({ role: "user", content: await runKikiTools(message.content, emit, options.callTool, screen) });
       continue;
     }
 
@@ -309,11 +317,15 @@ export async function runTurn(options: {
   }
 }
 
-/** Answers every client tool call in `content`: proposals become cards, reads and searches go to the app. */
+/**
+ * Answers every client tool call in `content`: proposals become cards; reads, searches and scrolls go to the
+ * app. `screen` counts the answer's scrolls and looks.
+ */
 async function runKikiTools(
   content: Anthropic.Beta.BetaContentBlock[],
   emit: (event: KikiEvent) => void,
   callTool: Parameters<typeof runTurn>[0]["callTool"],
+  screen: { steps: number },
 ): Promise<Anthropic.Beta.BetaToolResultBlockParam[]> {
   const results: Anthropic.Beta.BetaToolResultBlockParam[] = [];
   const answer = (id: string, text: string, isError = false) =>
@@ -356,6 +368,23 @@ async function runKikiTools(
       emit({ type: "tool_call", id: block.id, name: block.name, input: { ...search } });
       const result = await callTool(block.id, block.name, { ...search });
       answer(block.id, result.content, result.isError);
+    } else if (isScreenTool(block.name) && callTool) {
+      const parsed = block.name === "scroll" ? parseScroll(input) : { scroll: null };
+      if ("error" in parsed) {
+        answer(block.id, parsed.error, true);
+        continue;
+      }
+      if (screen.steps >= MAX_SCREEN_STEPS) {
+        answer(block.id, `That's as far as Kiki scrolls for one answer: answer with what you've seen, or use another tool.`, true);
+        continue;
+      }
+      screen.steps++;
+      const call = parsed.scroll ? { ...parsed.scroll } : {};
+      emit({ type: "activity", activity: { kind: "scroll", label: scrollLabel(parsed.scroll) } });
+      emit({ type: "tool_call", id: block.id, name: block.name, input: call });
+      const result = await callTool(block.id, block.name, call);
+      if (result.isError) answer(block.id, result.content, true);
+      else results.push({ type: "tool_result", tool_use_id: block.id, content: screenBlocks(result) });
     } else {
       answer(block.id, `The tool ${block.name} isn't available.`, true);
     }
