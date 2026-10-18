@@ -5,14 +5,28 @@ import {
   LIMITS,
   MODEL_CHOICES,
   type EffortLevel,
+  type FormField,
   type ModelChoice,
   type Screenshot,
   type Source,
 } from "@kiki/shared";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
-import type { ContextOmissions, PopupEvent, PopupInit, PopupLayout } from "../shared-types.ts";
-import { hostOf } from "./feed.ts";
+import type {
+  ContextOmissions,
+  EditInfo,
+  HistoryItem,
+  PastSession,
+  PastTurn,
+  PopupEvent,
+  PopupInit,
+  PopupLayout,
+  SavedAction,
+  WindowRect,
+} from "../shared-types.ts";
+import { renderActionCard, type CardOptions } from "./actionCard.ts";
+import { hostOf, plural } from "./feed.ts";
+import { renderHistory } from "./history.ts";
 import { icon, setIcon, type IconName } from "./icons.ts";
 import { cardBottomIn, INSETS, springStep, type Spring } from "./layout.ts";
 import { FADE_MS, freshRanges, revealTo, type FreshRange, type Reveal } from "./reveal.ts";
@@ -26,9 +40,11 @@ const kiki = window.kiki.popup;
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const popup = $<HTMLDivElement>("popup");
 const card = $<HTMLElement>("card");
+const mascot = $<HTMLButtonElement>("mascot");
 const closeButton = $<HTMLButtonElement>("close");
 const thread = $<HTMLDivElement>("thread");
 const threadContent = $<HTMLDivElement>("threadContent");
+const historyView = $<HTMLDivElement>("history");
 const composer = $<HTMLFormElement>("composer");
 const context = $<HTMLDivElement>("context");
 const chips = $<HTMLDivElement>("chips");
@@ -52,6 +68,12 @@ const omit: ContextOmissions = {};
 let started = false;
 let busy = false;
 let current: Answer | null = null;
+/** A Google account is connected, so cards act directly instead of opening Google in the browser. */
+let googleConnected = false;
+/** Where edit cards write: the window this popup opened over, until a past session is opened. */
+let editTarget: EditInfo | undefined;
+/** The form fields fill cards set, in that same window. */
+let formFields: FormField[] | undefined;
 let attachments: Array<Screenshot & { preview: string; id: number }> = [];
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, text?: string) {
@@ -80,11 +102,15 @@ let box: Spring = { value: 0, velocity: 0 };
 let sizeFrame = 0;
 let lastSizeFrame = 0;
 
-/** The chat box's natural height: the composer plus the whole conversation. */
+/** The chat box's natural height: the composer plus the whole conversation (or the past sessions). */
 function naturalHeight(): number {
   const style = getComputedStyle(card);
   const chrome = parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth);
-  const conversation = threadContent.childElementCount > 0 ? threadContent.offsetHeight : 0;
+  const conversation = historyOpen
+    ? historyView.offsetHeight
+    : threadContent.childElementCount > 0
+      ? threadContent.offsetHeight
+      : 0;
   return Math.ceil(chrome + conversation + composer.offsetHeight);
 }
 
@@ -108,6 +134,7 @@ async function show(cardHeight: number): Promise<void> {
     anchorY: height - INSETS.bottom,
     maxCard: height - INSETS.top - INSETS.bottom,
   };
+  popup.classList.toggle("shell-move", Boolean(place.shellMove));
   target = Math.min(naturalHeight(), place.maxCard);
   box = { value: target, velocity: 0 };
   placeBox(target);
@@ -148,9 +175,47 @@ function placeBox(height: number): void {
   popup.style.translate = `0 ${boxTop(rounded)}px`;
   if (stick) scrollToBottom(true);
   thread.classList.toggle("faded", thread.scrollTop > 4);
+  reportHitRect();
 }
 
+/** Where the chat box (with Kiki and its ✕) is, as last told to the main process. */
+let hitRect: WindowRect | null = null;
+let hitFrame = 0;
+
+/**
+ * Kiki stays open on top of other windows, but its window is mostly transparent space around the chat
+ * box: tells the main process where the box is, so clicks anywhere else go to the window below.
+ */
+function reportHitRect(): void {
+  if (!place?.staysOpen || hitFrame) return;
+  hitFrame = requestAnimationFrame(() => {
+    hitFrame = 0;
+    const rects = [card, mascot, closeButton].map((node) => node.getBoundingClientRect());
+    const slop = 2;
+    const left = Math.floor(Math.min(...rects.map((r) => r.left)) - slop);
+    const top = Math.floor(Math.min(...rects.map((r) => r.top)) - slop);
+    const right = Math.ceil(Math.max(...rects.map((r) => r.right)) + slop);
+    const bottom = Math.ceil(Math.max(...rects.map((r) => r.bottom)) + slop);
+    const rect = { x: left, y: top, width: right - left, height: bottom - top };
+    if (
+      hitRect &&
+      hitRect.x === rect.x &&
+      hitRect.y === rect.y &&
+      hitRect.width === rect.width &&
+      hitRect.height === rect.height
+    ) {
+      return;
+    }
+    hitRect = rect;
+    kiki.hitRect(rect);
+  });
+}
+
+// The box scales in as it first shows.
+popup.addEventListener("transitionend", () => reportHitRect());
+
 new ResizeObserver(() => layout()).observe(threadContent);
+new ResizeObserver(() => layout()).observe(historyView);
 new ResizeObserver(() => layout()).observe(composer);
 thread.addEventListener("scroll", () => thread.classList.toggle("faded", thread.scrollTop > 4));
 
@@ -166,20 +231,87 @@ function close(): void {
 }
 
 closeButton.addEventListener("click", close);
-// A click on the transparent space around the chat box is a click outside it.
+
+// Without click-through (Wayland without Kiki's GNOME extension v5), the transparent space around the
+// chat box would block the windows below it, so a click there, or focus leaving, closes Kiki instead.
+// Otherwise Kiki stays on top until it's closed: clicks around the box go to the window below.
 document.addEventListener("pointerdown", (event) => {
+  if (place?.staysOpen) return;
   if (event.target === document.body || event.target === document.documentElement) close();
 });
 
-// A popup, not a window to come back to: close when focus leaves.
+const INTERACTIVE = "button, textarea, input";
+
+/**
+ * Whether the pointer was last on a part of the box that moves the window. Those parts eat
+ * `pointerdown`, but moves near them still reach the page, so this goes by where the pointer was.
+ */
+let onDragRegion = false;
+/** The compositor is moving the window; its grab takes focus away, which isn't a reason to close. */
+let moving = false;
+
+function nearDragRegion(event: PointerEvent): boolean {
+  if ((event.target as Element | null)?.closest?.(INTERACTIVE)) return false;
+  const slop = 4;
+  return [".grip", ".actions"].some((selector) => {
+    const rect = card.querySelector(selector)?.getBoundingClientRect();
+    return (
+      rect !== undefined &&
+      event.clientX >= rect.left - slop &&
+      event.clientX <= rect.right + slop &&
+      event.clientY >= rect.top - slop &&
+      event.clientY <= rect.bottom + slop
+    );
+  });
+}
+
+/** Whether the pointer was over `hitRect`, as last told to the main process. */
+let pointerOver = true;
+
+document.addEventListener("pointermove", (event) => {
+  // Moves reach the page again once the compositor lets go of the window.
+  moving = false;
+  onDragRegion = nearDragRegion(event);
+  if (place?.staysOpen && hitRect) {
+    const inside =
+      event.clientX >= hitRect.x &&
+      event.clientX <= hitRect.x + hitRect.width &&
+      event.clientY >= hitRect.y &&
+      event.clientY <= hitRect.y + hitRect.height;
+    if (inside !== pointerOver) {
+      pointerOver = inside;
+      kiki.pointerOver(inside);
+    }
+  }
+});
+
+// With Kiki's GNOME extension, a press on the top edge or the toolbar's empty space has the extension
+// move the window. A move the window starts itself can't take its top above the top bar, and most of
+// the window is transparent space above the box, so the box couldn't go higher than where it opened.
+card.addEventListener("pointerdown", (event) => {
+  if (!popup.classList.contains("shell-move") || event.button !== 0) return;
+  const target = event.target as Element;
+  if (target.closest(INTERACTIVE) || !target.closest(".grip, .actions")) return;
+  event.preventDefault();
+  onDragRegion = true;
+  kiki.move();
+});
+
+// Without click-through, a popup, not a window to come back to: close when focus leaves.
 window.addEventListener("blur", () => {
+  if (place?.staysOpen) return;
   if (holdOpen || performance.now() - shownAt < 500) return;
+  if (onDragRegion) {
+    moving = true;
+    return;
+  }
   blurTimer = window.setTimeout(() => {
-    if (!holdOpen && !document.hasFocus()) close();
+    if (!holdOpen && !moving && !document.hasFocus()) close();
   }, 150);
 });
 window.addEventListener("focus", () => {
   window.clearTimeout(blurTimer);
+  moving = false;
   // Back from the file picker.
   if (holdOpen) setTimeout(() => (holdOpen = false), 300);
 });
@@ -188,6 +320,12 @@ document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
   if (modelMenu.classList.contains("open")) {
     setModelMenu(false);
+    input.focus();
+  } else if (historyOpen) {
+    closeHistory();
+    input.focus();
+  } else if ((event.target as HTMLElement | null)?.closest?.(".action-card")) {
+    // Leaves the card's field, keeping the edits.
     input.focus();
   } else {
     close();
@@ -239,11 +377,53 @@ function wrapFresh(root: HTMLElement, ranges: FreshRange[]): void {
   }
 }
 
+function renderMarkdown(markdown: string): string {
+  return DOMPurify.sanitize(marked.parse(markdown, { async: false, gfm: true }));
+}
+
+/** The links an answer cites, by site. */
+function sourceList(items: Source[]): HTMLElement {
+  const list = el("div", "sources");
+  for (const item of items) {
+    const link = el("a", undefined, hostOf(item.url));
+    link.href = item.url;
+    link.title = item.title;
+    list.append(link);
+  }
+  return list;
+}
+
+const cardOptions: CardOptions = {
+  get google() {
+    return googleConnected;
+  },
+  get edit() {
+    return editTarget;
+  },
+  get fields() {
+    return formFields;
+  },
+  run: async (id, edited, mode) => {
+    const result = await kiki.runAction(id, edited, mode);
+    // An edit moves the target onto Kiki's text, for the next card.
+    if (result.ok && result.edit !== undefined) editTarget = result.edit ?? undefined;
+    return result;
+  },
+  openSettings: () => kiki.openSettings(),
+  onChange: () => layout(),
+};
+
+function actionCard(saved: SavedAction): HTMLElement {
+  return renderActionCard(saved, cardOptions);
+}
+
 /** One assistant reply: the thinking feed, streamed markdown that fades in, then sources. */
 class Answer {
   readonly root = el("div", "msg assistant");
   readonly trace = new Trace(() => scrollToBottom());
   readonly body = el("div", "answer");
+  /** Action cards Kiki proposed, below the text. */
+  readonly cards = el("div", "action-cards");
   /** The markdown received so far; the first `#shown` characters of it are on screen. */
   raw = "";
   #shown = 0;
@@ -258,7 +438,7 @@ class Answer {
   #settleTimer = 0;
 
   constructor() {
-    this.root.append(this.trace.root, this.body);
+    this.root.append(this.trace.root, this.body, this.cards);
     threadContent.append(this.root);
     scrollToBottom(true);
   }
@@ -316,8 +496,7 @@ class Answer {
 
   #render(now: number): void {
     const stick = nearBottom();
-    const html = marked.parse(this.raw.slice(0, this.#shown), { async: false, gfm: true });
-    this.body.innerHTML = DOMPurify.sanitize(html);
+    this.body.innerHTML = renderMarkdown(this.raw.slice(0, this.#shown));
     const length = this.body.textContent?.length ?? 0;
     // Markdown can reread earlier text as more arrives (a closing ** turns literal stars into bold).
     if (length < this.#length) this.#reveals = this.#reveals.filter((reveal) => reveal.start < length);
@@ -334,16 +513,28 @@ class Answer {
     this.#run();
   }
 
+  /** The last `chars` of the text were Kiki's notes on the way to a lookup or card: they go in the feed. */
+  retract(chars: number): void {
+    const keep = Math.max(0, this.raw.length - chars);
+    const moved = this.raw.slice(keep).trim();
+    this.raw = this.raw.slice(0, keep);
+    this.#shown = Math.min(this.#shown, keep);
+    this.#reveals = [];
+    this.#render(performance.now());
+    if (!this.trace.root.isConnected) this.root.prepend(this.trace.root);
+    this.trace.resume();
+    if (moved) this.trace.addThinking(`\n\n${moved}`);
+  }
+
+  addCard(saved: SavedAction): void {
+    this.settleTrace();
+    this.cards.append(actionCard(saved));
+    scrollToBottom();
+  }
+
   sources(items: Source[]): void {
     this.#afterText(() => {
-      const list = el("div", "sources");
-      for (const item of items) {
-        const link = el("a", undefined, hostOf(item.url));
-        link.href = item.url;
-        link.title = item.title;
-        list.append(link);
-      }
-      this.root.append(list);
+      this.root.append(sourceList(items));
       scrollToBottom();
     });
   }
@@ -354,7 +545,7 @@ class Answer {
     this.finished = true;
     this.settleTrace();
     if (note) this.#afterText(() => this.root.append(el("div", "cutoff", note)));
-    if (!this.raw && !note) this.root.remove();
+    if (!this.raw && !note && !this.cards.hasChildNodes()) this.root.remove();
     this.#run();
   }
 }
@@ -398,6 +589,12 @@ function handleEvent(event: PopupEvent): void {
     case "sources":
       answer?.sources(event.items);
       break;
+    case "action":
+      answer?.addCard({ action: event.action });
+      break;
+    case "notes":
+      if (answer && !answer.finished) answer.retract(event.chars);
+      break;
     case "done":
       answer?.finish(event.stopReason === "max_tokens" ? "The answer was cut off." : undefined);
       break;
@@ -411,6 +608,9 @@ function handleEvent(event: PopupEvent): void {
       break;
     case "end":
       endTurn();
+      break;
+    case "context":
+      setTextChip(event.textChars, event.textPreview);
       break;
   }
 }
@@ -644,7 +844,7 @@ screenshotToggle.addEventListener("click", async () => {
 });
 
 // Clicking a control keeps the cursor in the question.
-for (const button of [modelButton, effortButton, searchToggle, screenshotToggle, attachButton, sendButton]) {
+for (const button of [mascot, modelButton, effortButton, searchToggle, screenshotToggle, attachButton, sendButton]) {
   button.addEventListener("mousedown", (event) => event.preventDefault());
 }
 
@@ -678,6 +878,7 @@ function isOn(button: HTMLButtonElement): boolean {
 async function ask(question: string): Promise<void> {
   question = question.trim();
   if (!question || busy) return;
+  closeHistory();
   const images = attachments;
   const options = { search: isOn(searchToggle), model, effort };
   // Kiki sends the screenshot once: with the first question, or the first one after it's turned on.
@@ -764,14 +965,32 @@ function addChip(
   return sync;
 }
 
-function renderContext(init: PopupInit): void {
-  const windowLabel = [init.appName, init.windowTitle].filter(Boolean).join(" — ");
-  if (windowLabel) addChip(windowLabel, "window", { title: windowLabel, name: "the window name" });
-  if (init.textChars > 0) {
-    const label = el("span");
-    label.append("Nearby text · ", el("span", "mono", formatChars(init.textChars)));
-    addChip(label, "text", { title: init.textPreview, name: "the nearby text" });
+/** The size in the "Nearby text" chip, once there is one. */
+let textCount: HTMLElement | null = null;
+
+/** Adds the "Nearby text" chip, or updates it when the window's full text arrives. */
+function setTextChip(chars: number, preview: string | undefined): void {
+  if (chars === 0) return;
+  if (textCount) {
+    textCount.textContent = formatChars(chars);
+    const chip = textCount.closest<HTMLElement>(".chip");
+    if (chip && preview) chip.title = preview;
+    return;
   }
+  textCount = el("span", "mono", formatChars(chars));
+  const label = el("span");
+  label.append("Nearby text · ", textCount);
+  addChip(label, "text", { title: preview, name: "the nearby text" });
+}
+
+function addWindowChip(appName: string | undefined, windowTitle: string | undefined): void {
+  const windowLabel = [appName, windowTitle].filter(Boolean).join(" — ");
+  if (windowLabel) addChip(windowLabel, "window", { title: windowLabel, name: "the window name" });
+}
+
+function renderContext(init: PopupInit): void {
+  addWindowChip(init.appName, init.windowTitle);
+  setTextChip(init.textChars, init.textPreview);
   if (init.screenshotThumb) {
     screenshotThumb = init.screenshotThumb;
     showScreenshotChip(init.screenshotThumb);
@@ -781,6 +1000,9 @@ function renderContext(init: PopupInit): void {
     screenshotToggle.hidden = false;
     syncScreenshot();
   }
+  googleConnected = init.google;
+  editTarget = init.edit;
+  formFields = init.fields;
   if (!init.configured) showError("Kiki isn't set up yet.", "unauthorized");
 }
 
@@ -935,10 +1157,119 @@ fileInput.addEventListener("cancel", () => {
   holdOpen = false;
 });
 
+// ---------- Past sessions (click Kiki) ----------
+
+let historyOpen = false;
+let historyLoading = false;
+/** Where the conversation was scrolled to, to come back to it. */
+let threadScroll = 0;
+
+async function openHistory(): Promise<void> {
+  if (historyLoading || busy) return;
+  historyLoading = true;
+  const items = await kiki.history().catch((): HistoryItem[] => []);
+  historyLoading = false;
+  if (busy) return;
+  showHistory(items);
+}
+
+function showHistory(items: HistoryItem[]): void {
+  renderHistory(historyView, items, {
+    open: (item) => void openPast(item),
+    clear: () => {
+      void kiki.clearHistory().finally(() => showHistory([]));
+    },
+  });
+  if (!historyOpen) threadScroll = thread.scrollTop;
+  historyOpen = true;
+  popup.classList.add("history-open");
+  mascot.setAttribute("aria-expanded", "true");
+  thread.scrollTop = 0;
+  layout();
+}
+
+function closeHistory(): void {
+  if (!historyOpen) return;
+  historyOpen = false;
+  popup.classList.remove("history-open");
+  mascot.setAttribute("aria-expanded", "false");
+  thread.scrollTop = threadScroll;
+  layout();
+}
+
+async function openPast(item: HistoryItem): Promise<void> {
+  if (item.current || busy) return closeHistory();
+  const past = await kiki.openSession(item.id).catch(() => null);
+  if (past) {
+    // Its cards are for another window.
+    editTarget = undefined;
+    formFields = undefined;
+    loadSession(past);
+  } else {
+    closeHistory();
+    flashNote("Kiki couldn't open that session.");
+  }
+}
+
+/** A finished answer from a past session, shown whole. */
+function pastAnswer(turn: PastTurn): HTMLElement {
+  const message = el("div", "msg assistant");
+  const body = el("div", "answer");
+  body.innerHTML = renderMarkdown(turn.answer);
+  message.append(body);
+  if (turn.actions?.length) {
+    const cards = el("div", "action-cards");
+    cards.append(...turn.actions.map(actionCard));
+    message.append(cards);
+  }
+  if (turn.sources?.length) message.append(sourceList(turn.sources));
+  if (turn.cutOff) message.append(el("div", "cutoff", "The answer was cut off."));
+  return message;
+}
+
+/**
+ * Switches the popup to a past session, to read and continue. Nothing from the window Kiki opened over
+ * comes along: its context, screenshot and attached images stay behind.
+ */
+function loadSession(past: PastSession): void {
+  attachments = [];
+  renderAttachments();
+  for (const key of Object.keys(omit) as Array<keyof ContextOmissions>) delete omit[key];
+  screenshotThumb = null;
+  screenshotSent = true;
+  syncScreenshotChip = null;
+  screenshotToggle.hidden = true;
+  textCount = null;
+  notes.hidden = true;
+  chips.replaceChildren();
+  addWindowChip(past.appName, past.windowTitle);
+  setTextChip(past.textChars, past.textPreview);
+
+  started = true;
+  card.classList.add("started");
+  chips.classList.add("locked");
+  input.placeholder = "Ask a follow-up…";
+  threadContent.replaceChildren(context);
+  for (const turn of past.turns) {
+    const question = userMessage(turn.question, []);
+    if (turn.images) question.prepend(el("div", "user-note", `Sent ${plural(turn.images, "image")}`));
+    threadContent.append(question, pastAnswer(turn));
+  }
+  closeHistory();
+  scrollToBottom(true);
+  updateSend();
+  input.focus();
+}
+
+mascot.addEventListener("click", () => {
+  if (historyOpen) closeHistory();
+  else void openHistory();
+});
+
 // ---------- Start ----------
 
-setIcon(closeButton, "x", 12, 2.5);
 setIcon(attachButton, "plus", 16, 2);
+setIcon(closeButton, "x", 12, 2.5);
 searchToggle.querySelector(".pill-icon")!.append(icon("globe", 14));
 screenshotToggle.querySelector(".pill-icon")!.append(icon("camera", 14));
 sendButton.querySelector(".send-arrow")!.append(icon("arrowUp", 16, 2.5));

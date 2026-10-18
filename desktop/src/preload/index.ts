@@ -12,10 +12,17 @@ const bridge: KikiBridge = {
       return () => ipcRenderer.removeListener("popup:event", handler);
     },
     close: () => ipcRenderer.send("popup:close"),
+    move: () => ipcRenderer.send("popup:move"),
+    hitRect: (rect) => ipcRenderer.send("popup:hitRect", rect),
+    pointerOver: (inside) => ipcRenderer.send("popup:pointerOver", inside),
     openLink: (url) => ipcRenderer.send("popup:openLink", url),
     openSettings: () => ipcRenderer.send("popup:openSettings"),
     screenshot: () => ipcRenderer.invoke("popup:screenshot"),
     show: (cardHeight) => ipcRenderer.invoke("popup:show", cardHeight),
+    history: () => ipcRenderer.invoke("popup:history"),
+    openSession: (id) => ipcRenderer.invoke("popup:openSession", id),
+    clearHistory: () => ipcRenderer.invoke("popup:clearHistory"),
+    runAction: (id, edited, mode) => ipcRenderer.invoke("popup:runAction", id, edited, mode),
   },
   settings: {
     get: () => ipcRenderer.invoke("settings:get"),
@@ -25,6 +32,8 @@ const bridge: KikiBridge = {
     installExtension: () => ipcRenderer.invoke("settings:installExtension"),
     enableAccessibility: () => ipcRenderer.invoke("settings:enableAccessibility"),
     requestMacPermissions: () => ipcRenderer.invoke("settings:requestMacPermissions"),
+    connectGoogle: () => ipcRenderer.invoke("settings:connectGoogle"),
+    disconnectGoogle: () => ipcRenderer.invoke("settings:disconnectGoogle"),
     quit: () => ipcRenderer.send("settings:quit"),
   },
 };

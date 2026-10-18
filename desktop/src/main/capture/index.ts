@@ -1,31 +1,31 @@
 import { LIMITS } from "@kiki/shared";
 import type { ScreenshotPolicy } from "../../shared-types.ts";
-import { CONTEXT_CHARS, VICINITY, type Capture, type LineBudget, type Vicinity } from "./common.ts";
+import { CONTEXT_CHARS, VICINITY, type Capture, type LineBudget, type RawCapture, type Vicinity } from "./common.ts";
 import { captureLinux } from "./linux.ts";
 import { captureMac } from "./mac.ts";
 
 export type { Capture } from "./common.ts";
 
 export async function captureContext(policy: ScreenshotPolicy): Promise<Capture> {
-  let raw: Capture;
+  let raw: RawCapture;
   if (process.platform === "linux") raw = await captureLinux(policy);
   else if (process.platform === "darwin") raw = await captureMac(policy);
   else raw = { selection: "", notes: ["Kiki can only read other apps on Linux and macOS."] };
 
-  const { vicinity, ...rest } = raw;
+  const { vicinity, focus, fullText, ...rest } = raw;
   const selection = raw.selection.trim().slice(0, LIMITS.selectionChars);
   return {
     ...rest,
     selection,
     appName: raw.appName?.slice(0, LIMITS.appNameChars) || undefined,
     windowTitle: raw.windowTitle?.slice(0, LIMITS.windowTitleChars) || undefined,
-    text: nearbyText(vicinity ? vicinityText(vicinity, selection) : raw.text, selection),
-    fullText: raw.fullText?.then((text) => nearbyText(text, selection)),
+    text: nearbyText(vicinity ? vicinityText(vicinity, selection) : raw.text, selection, focus),
+    fullText: fullText?.then((full) => full && nearbyText(full.text, selection, full.focus)),
   };
 }
 
-function nearbyText(text: string | undefined, selection: string): string | undefined {
-  const trimmed = text && trimAround(text, selection, CONTEXT_CHARS);
+function nearbyText(text: string | undefined, selection: string, focus?: number): string | undefined {
+  const trimmed = text && trimAround(text, selection, CONTEXT_CHARS, focus);
   // Text that is only the selection itself adds nothing.
   return trimmed && trimmed.trim() !== selection ? trimmed : undefined;
 }
@@ -36,12 +36,16 @@ function vicinityText(vicinity: Vicinity, selection: string): string {
   return trimLines(vicinity, budget) ?? trimAround(whole, selection, budget.chars);
 }
 
-/** Cuts `text` to `max` characters, keeping the selection near the middle when it is found. */
-export function trimAround(text: string, selection: string, max: number): string {
+/**
+ * Cuts `text` to `max` characters, keeping the selection near the middle when it is found, or else the
+ * `focus` offset (the middle of what's on screen).
+ */
+export function trimAround(text: string, selection: string, max: number, focus?: number): string {
   if (text.length <= max) return text;
   const at = selection ? text.indexOf(selection.slice(0, 200)) : -1;
-  if (at < 0) return text.slice(0, max) + "…";
-  const start = Math.max(0, Math.min(at - Math.floor((max - selection.length) / 2), text.length - max));
+  const middle = at >= 0 ? at + Math.floor(selection.length / 2) : focus;
+  if (middle === undefined) return text.slice(0, max) + "…";
+  const start = Math.max(0, Math.min(middle - Math.floor(max / 2), text.length - max));
   const end = start + max;
   return (start > 0 ? "…" : "") + text.slice(start, end) + (end < text.length ? "…" : "");
 }

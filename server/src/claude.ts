@@ -1,7 +1,30 @@
 import Anthropic from "@anthropic-ai/sdk";
-import type { Activity, ErrorCode, KikiEvent, ModelChoice, Source, StatusPhase } from "@kiki/shared";
+import type {
+  Activity,
+  ErrorCode,
+  KikiEvent,
+  ModelChoice,
+  AppToolName,
+  Source,
+  StatusPhase,
+  ToolAccess,
+  ToolResult,
+} from "@kiki/shared";
 import type { UsageDelta } from "./codes.ts";
-import { SYSTEM_PROMPT } from "./prompt.ts";
+import { systemPrompt } from "./prompt.ts";
+import {
+  CHECK_LABELS,
+  isCheckTool,
+  isOpenTool,
+  isProposalTool,
+  isReadTool,
+  LOOKUP_LABELS,
+  parseProposal,
+  parseSearch,
+  PROPOSAL_ACK,
+  searchLabel,
+  toolsFor,
+} from "./tools.ts";
 
 export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -39,6 +62,8 @@ export const MODEL_IDS: Record<ModelChoice, string> = {
 
 const FALLBACK_BETA = "server-side-fallback-2026-07-01";
 const MAX_PAUSE_RESUMES = 3;
+/** Rounds of Kiki's own tools (cards and lookups) per answer; after that Claude must answer. */
+const MAX_TOOL_ROUNDS = 4;
 const MAX_UNCITED_SOURCES = 5;
 const MAX_RESULTS_SHOWN = 5;
 // Keeps a fetched page to roughly the size of the nearby text we already send.
@@ -47,8 +72,8 @@ const FETCH_CONTENT_TOKENS = 8_000;
 export type TurnResult =
   | {
       kind: "answered";
-      /** Append these to the conversation unchanged. */
-      assistantMessages: Anthropic.Beta.BetaMessageParam[];
+      /** Append these to the conversation unchanged: Claude's replies, and the results of Kiki's tools. */
+      messages: Anthropic.Beta.BetaMessageParam[];
       stopReason: string;
       sources: Source[];
       usage: UsageDelta;
@@ -140,13 +165,25 @@ export async function runTurn(options: {
   model?: string;
   /** Overrides `config.effort` for this turn (the effort button). */
   effort?: Effort;
+  /** Which of Kiki's own tools the app handles. */
+  tools?: ToolAccess;
+  /** The personality the person chose, added to the end of the system prompt. */
+  personality?: string;
+  /** Runs a read tool in the app and waits for its result. */
+  callTool?: (id: string, name: AppToolName, input: Record<string, unknown>) => Promise<ToolResult>;
 }): Promise<TurnResult> {
   const { client, config, history, emit, signal } = options;
   const model = options.model ?? config.model;
   const effort = options.effort ?? config.effort;
   const thinking = hasAdaptiveThinking(model);
   const useFallbacks = config.fallbacks && !isHaiku(model);
-  const assistantMessages: Anthropic.Beta.BetaMessageParam[] = [];
+  const messages: Anthropic.Beta.BetaMessageParam[] = [];
+  const tools = [...webTools(model, config), ...toolsFor(options.tools)];
+  const system = systemPrompt(options.personality);
+  let pauses = 0;
+  let toolRounds = 0;
+  /** Answer text the current response has streamed. */
+  let responseChars = 0;
   const sources = new SourceCollector();
   const usage = emptyUsage();
   let phase: StatusPhase | null = null;
@@ -158,16 +195,23 @@ export async function runTurn(options: {
     emit(query === undefined ? { type: "status", phase: next } : { type: "status", phase: next, query });
   };
   const activity = (item: Activity) => emit({ type: "activity", activity: item });
+  const text = (delta: string) => {
+    responseChars += delta.length;
+    emit({ type: "text", delta });
+  };
 
-  for (let attempt = 0; ; attempt++) {
+  for (;;) {
     setPhase("thinking");
+    responseChars = 0;
     const stream = client.beta.messages.stream(
       {
         model,
         max_tokens: config.maxTokens,
-        system: SYSTEM_PROMPT,
-        messages: [...history, ...assistantMessages],
-        tools: webTools(model, config),
+        system,
+        messages: [...history, ...messages],
+        tools,
+        // Out of tool rounds: Claude answers with what it has.
+        ...(toolRounds >= MAX_TOOL_ROUNDS ? { tool_choice: { type: "none" as const } } : {}),
         // Summaries of the reasoning (and the notes between tool calls) feed the popup's thinking feed.
         ...(thinking ? { thinking: { type: "adaptive" as const, display: "summarized" as const } } : {}),
         output_config: { effort },
@@ -189,6 +233,16 @@ export async function runTurn(options: {
         if (thoughtBlocks++ > 0) emit({ type: "thinking", delta: "\n\n" });
       } else if (block.type === "text") {
         setPhase("writing");
+      } else if (
+        block.type === "tool_use" &&
+        (isProposalTool(block.name) || isReadTool(block.name) || isOpenTool(block.name))
+      ) {
+        // What Claude wrote before using a tool was notes on its way there, not the answer.
+        if (responseChars > 0) {
+          emit({ type: "notes", chars: responseChars });
+          responseChars = 0;
+        }
+        setPhase("thinking");
       }
     });
     stream.on("thinking", (delta) => {
@@ -228,7 +282,7 @@ export async function runTurn(options: {
         sources.addCited(citation.url, citation.title);
       }
     });
-    stream.on("text", (delta) => emit({ type: "text", delta }));
+    stream.on("text", (delta) => text(delta));
 
     const message = await stream.finalMessage();
     addUsage(usage, message.usage);
@@ -236,18 +290,77 @@ export async function runTurn(options: {
     if (message.stop_reason === "refusal") {
       return { kind: "refused", usage };
     }
-    assistantMessages.push({ role: "assistant", content: message.content });
+    messages.push({ role: "assistant", content: message.content });
     // A long server-side search loop pauses; resend the turn as-is to let it continue.
-    if (message.stop_reason === "pause_turn" && attempt < MAX_PAUSE_RESUMES) continue;
+    if (message.stop_reason === "pause_turn" && pauses++ < MAX_PAUSE_RESUMES) continue;
+    if (message.stop_reason === "tool_use") {
+      toolRounds++;
+      messages.push({ role: "user", content: await runKikiTools(message.content, emit, options.callTool) });
+      continue;
+    }
 
     return {
       kind: "answered",
-      assistantMessages,
+      messages,
       stopReason: message.stop_reason ?? "end_turn",
       sources: sources.result(),
       usage,
     };
   }
+}
+
+/** Answers every client tool call in `content`: proposals become cards, reads and searches go to the app. */
+async function runKikiTools(
+  content: Anthropic.Beta.BetaContentBlock[],
+  emit: (event: KikiEvent) => void,
+  callTool: Parameters<typeof runTurn>[0]["callTool"],
+): Promise<Anthropic.Beta.BetaToolResultBlockParam[]> {
+  const results: Anthropic.Beta.BetaToolResultBlockParam[] = [];
+  const answer = (id: string, text: string, isError = false) =>
+    results.push({ type: "tool_result", tool_use_id: id, content: text, ...(isError ? { is_error: true } : {}) });
+
+  for (const block of content) {
+    if (block.type !== "tool_use") continue;
+    const input = (block.input ?? {}) as Record<string, unknown>;
+    if (isProposalTool(block.name)) {
+      const parsed = parseProposal(block.name, input);
+      if ("error" in parsed) {
+        answer(block.id, parsed.error, true);
+        continue;
+      }
+      if (isCheckTool(block.name) && callTool) {
+        // The app checks it against the text (or form) as it is now; an error goes back to Claude to fix.
+        emit({ type: "activity", activity: { kind: "lookup", label: CHECK_LABELS[block.name] } });
+        emit({ type: "tool_call", id: block.id, name: block.name, input: { ...parsed.action } });
+        const checked = await callTool(block.id, block.name, { ...parsed.action });
+        if (checked.isError) {
+          answer(block.id, checked.content, true);
+          continue;
+        }
+      }
+      emit({ type: "action", action: parsed.action });
+      answer(block.id, PROPOSAL_ACK);
+    } else if (isReadTool(block.name) && callTool) {
+      emit({ type: "activity", activity: { kind: "lookup", label: LOOKUP_LABELS[block.name] } });
+      emit({ type: "tool_call", id: block.id, name: block.name, input });
+      const result = await callTool(block.id, block.name, input);
+      answer(block.id, result.content, result.isError);
+    } else if (isOpenTool(block.name) && callTool) {
+      const parsed = parseSearch(input);
+      if ("error" in parsed) {
+        answer(block.id, parsed.error, true);
+        continue;
+      }
+      const { search } = parsed;
+      emit({ type: "activity", activity: { kind: "open", label: searchLabel(search), query: search.query } });
+      emit({ type: "tool_call", id: block.id, name: block.name, input: { ...search } });
+      const result = await callTool(block.id, block.name, { ...search });
+      answer(block.id, result.content, result.isError);
+    } else {
+      answer(block.id, `The tool ${block.name} isn't available.`, true);
+    }
+  }
+  return results;
 }
 
 export interface ClassifiedError {

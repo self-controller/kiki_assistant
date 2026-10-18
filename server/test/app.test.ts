@@ -4,6 +4,7 @@ import { createApp } from "../src/app.ts";
 import { DEFAULT_CLAUDE_CONFIG } from "../src/claude.ts";
 import { CodeStore } from "../src/codes.ts";
 import { ConversationStore } from "../src/conversations.ts";
+import { SYSTEM_PROMPT } from "../src/prompt.ts";
 import type { SttConfig } from "../src/stt.ts";
 import { fakeClient, readEvents, type FakeResponse } from "./helpers.ts";
 
@@ -274,6 +275,38 @@ describe("follow-ups", () => {
     expect(t.requests[1]!.output_config).toEqual({ effort: "low" });
   });
 
+  it("starts a conversation that continues earlier turns", async () => {
+    const t = setup([{ blocks: [{ type: "text", text: "Third." }] }]);
+    const earlier = [
+      { question: "What is this?", answer: "First." },
+      { question: "And?", answer: "Second." },
+    ];
+    const events = await readEvents(
+      await t.post("/v1/conversations", { ...START, question: "One more?", images: [IMAGE], earlier }),
+    );
+    expect(events.at(-1)).toEqual({ type: "done", stopReason: "end_turn" });
+    const sent = t.requests[0]!.messages as Array<{ role: string; content: Array<{ type: string; text?: string }> }>;
+    expect(sent.map((m) => m.role)).toEqual(["user", "assistant", "user", "assistant", "user"]);
+    // The context goes with the first question; the new one comes last, with its images.
+    expect(sent[0]!.content.map((block) => block.type)).toEqual(["text"]);
+    expect(sent[0]!.content[0]!.text).toContain("<nearby_text>\nSome page text about Kiki.\n</nearby_text>");
+    expect(sent[0]!.content[0]!.text).toMatch(/<question>\nWhat is this\?\n<\/question>$/);
+    expect(sent[1]!.content).toEqual([{ type: "text", text: "First." }]);
+    expect(sent[2]!.content).toEqual([{ type: "text", text: "And?" }]);
+    expect(sent[3]!.content).toEqual([{ type: "text", text: "Second." }]);
+    expect(sent[4]!.content.map((block) => block.type)).toEqual(["image", "text"]);
+    expect(sent[4]!.content[1]!.text).toBe("The person attached an image.\n\n<question>\nOne more?\n</question>");
+
+    const id = (events[0] as { id: string }).id;
+    expect(t.conversations.get(id, t.record.id)!.userTurns).toBe(3);
+  });
+
+  it("rejects too many earlier turns", async () => {
+    const t = setup([]);
+    const earlier = Array.from({ length: 11 }, () => ({ question: "Q", answer: "A" }));
+    expect((await t.post("/v1/conversations", { ...START, earlier })).status).toBe(400);
+  });
+
   it("carries images and toggles on follow-ups", async () => {
     const t = setup([
       { blocks: [{ type: "text", text: "First." }] },
@@ -310,6 +343,26 @@ describe("follow-ups", () => {
     expect((t.requests[1]!.messages as unknown[]).length).toBe(3);
   });
 
+  it("adds the person's personality to the system prompt for the whole conversation", async () => {
+    const t = setup([1, 2, 3].map(() => ({ blocks: [{ type: "text" as const, text: "ok" }] })));
+    await readEvents(await t.post("/v1/conversations", START));
+    expect(t.requests[0]!.system).toBe(SYSTEM_PROMPT);
+
+    const first = await readEvents(await t.post("/v1/conversations", { ...START, personality: "  Talk like a pirate.  " }));
+    const id = (first[0] as { id: string }).id;
+    await readEvents(await t.post(`/v1/conversations/${id}/messages`, { question: "And?" }));
+    expect(t.requests[1]!.system).toBe(
+      `${SYSTEM_PROMPT}\n\nThe person chose this personality for you. Adopt it; the rules above still apply.\n<personality>\nTalk like a pirate.\n</personality>`,
+    );
+    expect(t.requests[2]!.system).toBe(t.requests[1]!.system);
+  });
+
+  it("rejects personalities over the limit", async () => {
+    const t = setup([]);
+    const response = await t.post("/v1/conversations", { ...START, personality: "x".repeat(2_001) });
+    expect(response.status).toBe(400);
+  });
+
   it("returns 404 for unknown conversations and 409 while busy", async () => {
     const t = setup([]);
     const missing = await t.post("/v1/conversations/nope/messages", { question: "Hi" });
@@ -331,7 +384,7 @@ describe("GET /v1/me", () => {
       name: "tester",
       usedToday: 0,
       dailyLimit: 10,
-      features: { voice: false },
+      features: { voice: false, actions: true },
     });
   });
 });
@@ -386,5 +439,458 @@ describe("POST /v1/transcribe", () => {
     const failed = await sendAudio(t, audio);
     expect(failed.status).toBe(502);
     expect(await failed.json()).toMatchObject({ error: { code: "upstream" } });
+  });
+});
+
+describe("Kiki's own tools", () => {
+  const TOOLS = { actions: true, calendarRead: true, tasksRead: true };
+
+  /** Reads SSE events until one of `type` arrives; returns those so far and the rest of the stream. */
+  async function readUntil(response: Response, type: string) {
+    const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader();
+    let text = "";
+    while (!text.includes(`"type":"${type}"`)) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error(`stream ended before ${type}`);
+      text += value;
+    }
+    const rest = async () => {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        text += value;
+      }
+      return readEvents(new Response(text));
+    };
+    return { events: await readEvents(new Response(text)), rest };
+  }
+
+  function toolNames(request: Record<string, unknown>): string[] {
+    return (request.tools as Array<{ name: string }>).map((tool) => tool.name);
+  }
+
+  it("offers proposal tools only to apps that show cards, and reads only when connected", async () => {
+    const t = setup([1, 2, 3].map(() => ({ blocks: [{ type: "text" as const, text: "ok" }] })));
+    await readEvents(await t.post("/v1/conversations", START));
+    await readEvents(await t.post("/v1/conversations", { ...START, tools: { actions: true } }));
+    await readEvents(await t.post("/v1/conversations", { ...START, tools: TOOLS }));
+    expect(toolNames(t.requests[0]!)).toEqual(["web_search", "web_fetch"]);
+    expect(toolNames(t.requests[1]!)).toEqual([
+      "web_search",
+      "web_fetch",
+      "propose_calendar_event",
+      "propose_task",
+      "propose_email",
+    ]);
+    expect(toolNames(t.requests[2]!)).toContain("list_calendar_events");
+    expect(toolNames(t.requests[2]!)).toContain("list_tasks");
+  });
+
+  it("turns a proposal into a card and tells Claude it isn't done yet", async () => {
+    const t = setup([
+      {
+        blocks: [
+          { type: "text", text: "Adding it." },
+          {
+            type: "tool_use",
+            name: "propose_calendar_event",
+            input: { title: "Lunch with Sam", start: "2026-10-20T13:00", location: "Café X" },
+          },
+        ],
+        stopReason: "tool_use",
+      },
+      { blocks: [{ type: "text", text: "Check the card." }] },
+    ]);
+    const events = await readEvents(await t.post("/v1/conversations", { ...START, tools: TOOLS }));
+    // What Claude wrote on its way to the card goes to the thinking feed.
+    expect(events.filter((e) => e.type === "text" || e.type === "notes")).toEqual([
+      { type: "text", delta: "Addin" },
+      { type: "text", delta: "g it." },
+      { type: "notes", chars: 10 },
+      { type: "text", delta: "Check th" },
+      { type: "text", delta: "e card." },
+    ]);
+    const action = events.find((e) => e.type === "action");
+    expect(action).toMatchObject({
+      action: { kind: "event", title: "Lunch with Sam", start: "2026-10-20T13:00", end: "2026-10-20T14:00", location: "Café X" },
+    });
+    expect(events.at(-1)).toEqual({ type: "done", stopReason: "end_turn" });
+    const sent = t.requests[1]!.messages as Array<{ role: string; content: Array<Record<string, unknown>> }>;
+    expect(sent.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(sent[2]!.content[0]).toMatchObject({ type: "tool_result", tool_use_id: "toolu_1" });
+    expect(sent[2]!.content[0]!.content).toContain("Nothing has been created or sent yet");
+    // Counts as one question, and the history keeps the whole exchange.
+    expect(t.codes.usedToday(t.record.id)).toBe(1);
+    const id = (events[0] as { id: string }).id;
+    expect(t.conversations.get(id, t.record.id)!.messages.map((m) => m.role)).toEqual([
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+    ]);
+  });
+
+  it("returns invalid proposals to Claude as errors", async () => {
+    const t = setup([
+      {
+        blocks: [{ type: "tool_use", name: "propose_email", input: { to: ["not an address"], subject: "Hi", body: "Hi" } }],
+        stopReason: "tool_use",
+      },
+      { blocks: [{ type: "text", text: "Sorry." }] },
+    ]);
+    const events = await readEvents(await t.post("/v1/conversations", { ...START, tools: TOOLS }));
+    expect(events.some((e) => e.type === "action")).toBe(false);
+    const sent = t.requests[1]!.messages as Array<{ content: Array<Record<string, unknown>> }>;
+    expect(sent[2]!.content[0]).toMatchObject({ is_error: true });
+  });
+
+  it("asks the app to run read tools and continues with the result", async () => {
+    const t = setup([
+      {
+        blocks: [
+          {
+            type: "tool_use",
+            name: "list_calendar_events",
+            input: { time_min: "2026-10-22T12:00", time_max: "2026-10-22T18:00" },
+          },
+        ],
+        stopReason: "tool_use",
+      },
+      { blocks: [{ type: "text", text: "You're free." }] },
+    ]);
+    const response = await t.post("/v1/conversations", { ...START, tools: TOOLS });
+    const { events, rest } = await readUntil(response, "tool_call");
+    const id = (events[0] as { id: string }).id;
+    expect(events).toContainEqual({ type: "activity", activity: { kind: "lookup", label: "Checking your calendar" } });
+    expect(events.at(-1)).toMatchObject({ type: "tool_call", id: "toolu_0", name: "list_calendar_events" });
+
+    const posted = await t.post(`/v1/conversations/${id}/tool-results`, {
+      results: [{ id: "toolu_0", content: "No events." }],
+    });
+    expect(posted.status).toBe(200);
+    const all = await rest();
+    expect(all.at(-1)).toEqual({ type: "done", stopReason: "end_turn" });
+    const sent = t.requests[1]!.messages as Array<{ content: Array<Record<string, unknown>> }>;
+    expect(sent[2]!.content[0]).toMatchObject({ type: "tool_result", tool_use_id: "toolu_0", content: "No events." });
+
+    // Nothing is waiting anymore.
+    const late = await t.post(`/v1/conversations/${id}/tool-results`, { results: [{ id: "toolu_0", content: "x" }] });
+    expect(late.status).toBe(404);
+  });
+
+  it("gives Claude an error when the app doesn't answer in time", async () => {
+    const codes = new CodeStore(":memory:");
+    const { code } = codes.create("tester", 10);
+    const fake = fakeClient([
+      { blocks: [{ type: "tool_use", name: "list_tasks", input: {} }], stopReason: "tool_use" },
+      { blocks: [{ type: "text", text: "Couldn't check." }] },
+    ]);
+    const app = createApp({
+      codes,
+      conversations: new ConversationStore(),
+      client: fake.client,
+      config: DEFAULT_CLAUDE_CONFIG,
+      toolTimeoutMs: 10,
+      log: () => {},
+    });
+    const response = await app.request("/v1/conversations", {
+      method: "POST",
+      headers: { authorization: `Bearer ${code}`, "content-type": "application/json" },
+      body: JSON.stringify({ ...START, tools: TOOLS }),
+    });
+    const events = await readEvents(response);
+    expect(events.at(-1)).toEqual({ type: "done", stopReason: "end_turn" });
+    const sent = fake.requests[1]!.messages as Array<{ content: Array<Record<string, unknown>> }>;
+    expect(sent[2]!.content[0]).toMatchObject({ is_error: true, content: "The Kiki app didn't answer in time." });
+  });
+
+  it("offers open_search only to apps that open searches, with or without cards", async () => {
+    const t = setup([1, 2, 3].map(() => ({ blocks: [{ type: "text" as const, text: "ok" }] })));
+    await readEvents(await t.post("/v1/conversations", { ...START, tools: TOOLS }));
+    await readEvents(await t.post("/v1/conversations", { ...START, tools: { open: true } }));
+    await readEvents(await t.post("/v1/conversations", { ...START, tools: { ...TOOLS, open: true } }));
+    expect(toolNames(t.requests[0]!)).not.toContain("open_search");
+    expect(toolNames(t.requests[1]!)).toEqual(["web_search", "web_fetch", "open_search"]);
+    expect(toolNames(t.requests[2]!).at(-1)).toBe("open_search");
+  });
+
+  it("has the app open a search, with the site cut down to its domain", async () => {
+    const t = setup([
+      {
+        blocks: [
+          { type: "text", text: "Opening it." },
+          {
+            type: "tool_use",
+            name: "open_search",
+            input: { where: "web", query: " intentionality ", site: "https://www.Substack.com/@someone" },
+          },
+        ],
+        stopReason: "tool_use",
+      },
+      { blocks: [{ type: "text", text: "Opened a Substack search." }] },
+    ]);
+    const response = await t.post("/v1/conversations", { ...START, tools: { ...TOOLS, open: true } });
+    const { events, rest } = await readUntil(response, "tool_call");
+    const id = (events[0] as { id: string }).id;
+    // What Claude wrote on its way to the tool goes to the thinking feed.
+    expect(events).toContainEqual({ type: "notes", chars: 11 });
+    expect(events).toContainEqual({
+      type: "activity",
+      activity: { kind: "open", label: "substack.com on Google", query: "intentionality" },
+    });
+    expect(events.at(-1)).toEqual({
+      type: "tool_call",
+      id: "toolu_1",
+      name: "open_search",
+      input: { where: "web", query: "intentionality", site: "substack.com" },
+    });
+
+    await t.post(`/v1/conversations/${id}/tool-results`, {
+      results: [{ id: "toolu_1", content: "Opened it in a new tab of the person's browser." }],
+    });
+    expect((await rest()).at(-1)).toEqual({ type: "done", stopReason: "end_turn" });
+    const sent = t.requests[1]!.messages as Array<{ content: Array<Record<string, unknown>> }>;
+    expect(sent[2]!.content[0]).toMatchObject({
+      type: "tool_result",
+      tool_use_id: "toolu_1",
+      content: "Opened it in a new tab of the person's browser.",
+    });
+  });
+
+  it("returns searches Kiki can't open to Claude as errors, without asking the app", async () => {
+    const bad = [
+      { where: "videos", query: "puppies", site: "substack.com" },
+      { where: "web", query: "puppies", site: "not a domain" },
+      { where: "anywhere", query: "puppies" },
+      { where: "web", query: "   " },
+    ];
+    const t = setup(
+      bad.flatMap((input) => [
+        { blocks: [{ type: "tool_use" as const, name: "open_search", input }], stopReason: "tool_use" },
+        { blocks: [{ type: "text" as const, text: "Sorry." }] },
+      ]),
+    );
+    for (let i = 0; i < bad.length; i++) {
+      const events = await readEvents(await t.post("/v1/conversations", { ...START, tools: { open: true } }));
+      expect(events.some((e) => e.type === "tool_call" || e.type === "activity")).toBe(false);
+      const sent = t.requests[i * 2 + 1]!.messages as Array<{ content: Array<Record<string, unknown>> }>;
+      expect(sent[2]!.content[0]).toMatchObject({ type: "tool_result", is_error: true });
+    }
+  });
+
+  it("offers propose_edit only when the app can write at the cursor, and says where it writes", async () => {
+    const t = setup([1, 2, 3].map(() => ({ blocks: [{ type: "text" as const, text: "ok" }] })));
+    await readEvents(await t.post("/v1/conversations", { ...START, tools: TOOLS }));
+    await readEvents(await t.post("/v1/conversations", { ...START, tools: { ...TOOLS, edit: "replace" } }));
+    await readEvents(await t.post("/v1/conversations", { ...START, tools: { ...TOOLS, edit: "insert" } }));
+    const firstText = (i: number) =>
+      (t.requests[i]!.messages as Array<{ content: Array<{ text?: string }> }>)[0]!.content.at(-1)!.text!;
+    expect(toolNames(t.requests[0]!)).not.toContain("propose_edit");
+    expect(firstText(0)).not.toContain("propose_edit");
+    expect(toolNames(t.requests[1]!)).toContain("propose_edit");
+    expect(firstText(1)).toContain("<kiki_request>The highlighted text is editable: propose_edit replaces it.</kiki_request>");
+    expect(firstText(2)).toContain("propose_edit inserts text at the cursor");
+    // The tools stay the same across apps, so only the tool list differs, not the system prompt.
+    expect(t.requests[1]!.system).toEqual(t.requests[0]!.system);
+  });
+
+  it("rejects edit modes the protocol doesn't have", async () => {
+    const t = setup([]);
+    const response = await t.post("/v1/conversations", { ...START, tools: { ...TOOLS, edit: "overwrite" } });
+    expect(response.status).toBe(400);
+  });
+
+  it("turns propose_edit into an edit card, keeping its whitespace", async () => {
+    const t = setup([
+      {
+        blocks: [{ type: "tool_use", name: "propose_edit", input: { text: "  fixed line\n" } }],
+        stopReason: "tool_use",
+      },
+      { blocks: [{ type: "tool_use", name: "propose_edit", input: { text: "" } }], stopReason: "tool_use" },
+      { blocks: [{ type: "text", text: "Fixed the typo." }] },
+    ]);
+    const events = await readEvents(await t.post("/v1/conversations", { ...START, tools: { ...TOOLS, edit: "replace" } }));
+    const cards = events.filter((e) => e.type === "action");
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ action: { kind: "edit", text: "  fixed line\n" } });
+    const second = t.requests[2]!.messages as Array<{ content: Array<Record<string, unknown>> }>;
+    expect(second.at(-1)!.content[0]).toMatchObject({ is_error: true });
+  });
+
+  it("tells Claude what the person did with an edit card", async () => {
+    const t = setup([
+      { blocks: [{ type: "text", text: "ok" }] },
+      { blocks: [{ type: "text", text: "Done." }] },
+    ]);
+    const first = await readEvents(await t.post("/v1/conversations", { ...START, tools: { ...TOOLS, edit: "replace" } }));
+    const id = (first[0] as { id: string }).id;
+    await readEvents(
+      await t.post(`/v1/conversations/${id}/messages`, {
+        question: "Shorter",
+        tools: { ...TOOLS, edit: "replace" },
+        actionOutcomes: [{ id: "e1", kind: "edit", outcome: "applied", summary: "Replaced in Text Editor." }],
+      }),
+    );
+    const followUp = (t.requests[1]!.messages as Array<{ content: Array<{ text?: string }> }>)[2]!.content[0]!.text;
+    expect(followUp).toContain("- edit card: the person put it into their app. Replaced in Text Editor.");
+  });
+
+  it("puts the local time and earlier card outcomes in the prompt", async () => {
+    const t = setup([
+      { blocks: [{ type: "text", text: "ok" }] },
+      { blocks: [{ type: "text", text: "Done." }] },
+    ]);
+    const first = await readEvents(
+      await t.post("/v1/conversations", {
+        ...START,
+        tools: TOOLS,
+        clock: { timeZone: "America/Toronto", now: "2026-10-16T14:03:00-04:00" },
+      }),
+    );
+    const firstText = (t.requests[0]!.messages as Array<{ content: Array<{ text?: string }> }>)[0]!.content.at(-1)!.text;
+    expect(firstText).toMatch(/^Current local time: Fri 2026-10-16 14:03 \(America\/Toronto\)/);
+
+    const id = (first[0] as { id: string }).id;
+    await readEvents(
+      await t.post(`/v1/conversations/${id}/messages`, {
+        question: "Did it work?",
+        actionOutcomes: [{ id: "a1", kind: "event", outcome: "added", summary: "Lunch, Tue 13:00." }],
+      }),
+    );
+    const followUp = (t.requests[1]!.messages as Array<{ content: Array<{ text?: string }> }>)[2]!.content[0]!.text;
+    expect(followUp).toContain("- event card: the person added it. Lunch, Tue 13:00.");
+    expect(followUp).toContain("<question>\nDid it work?\n</question>");
+  });
+
+  const FORM: StartConversationRequest["context"] = {
+    ...START.context,
+    editable: { text: "teh cat sat on teh mat" },
+    fields: [
+      { id: "f1", label: "Full name", kind: "text", value: "" },
+      { id: "f2", label: "Agree", kind: "checkbox", checked: false },
+    ],
+  };
+
+  it("offers propose_changes and propose_fill only when the app can apply them, with the text and fields", async () => {
+    const t = setup([1, 2, 3].map(() => ({ blocks: [{ type: "text" as const, text: "ok" }] })));
+    await readEvents(await t.post("/v1/conversations", { ...START, context: FORM, tools: TOOLS }));
+    await readEvents(
+      await t.post("/v1/conversations", { ...START, context: FORM, tools: { ...TOOLS, changes: "text", fill: true } }),
+    );
+    await readEvents(await t.post("/v1/conversations", { ...START, tools: { ...TOOLS, changes: "docs" } }));
+    const firstText = (i: number) =>
+      (t.requests[i]!.messages as Array<{ content: Array<{ text?: string }> }>)[0]!.content.at(-1)!.text!;
+    expect(toolNames(t.requests[0]!)).not.toContain("propose_changes");
+    expect(toolNames(t.requests[0]!)).not.toContain("propose_fill");
+    expect(toolNames(t.requests[1]!)).toEqual(expect.arrayContaining(["propose_changes", "propose_fill"]));
+    expect(firstText(1)).toContain("<editable_text>\nteh cat sat on teh mat\n</editable_text>");
+    expect(firstText(1)).toContain('<form_fields>\nf1 text "Full name": ""\nf2 checkbox "Agree": unchecked\n</form_fields>');
+    expect(firstText(1)).toContain("propose_changes changes the text the cursor is in, all of it in <editable_text>.");
+    expect(firstText(2)).toContain("This is a Google Doc.");
+    expect(firstText(2)).toContain("ask them to press the camera button");
+    expect(toolNames(t.requests[2]!)).not.toContain("propose_fill");
+  });
+
+  it("rejects malformed form fields and changes modes", async () => {
+    const t = setup([]);
+    const badField = { ...FORM, fields: [{ id: "name", label: "Full name", kind: "text" }] };
+    expect((await t.post("/v1/conversations", { ...START, context: badField })).status).toBe(400);
+    expect((await t.post("/v1/conversations", { ...START, tools: { ...TOOLS, changes: "all" } })).status).toBe(400);
+  });
+
+  /** Reads the whole stream, answering each tool_call with the next of `answers` as it arrives. */
+  async function answeringToolCalls(
+    t: ReturnType<typeof setup>,
+    response: Response,
+    answers: Array<{ content: string; isError?: boolean }>,
+  ) {
+    const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader();
+    let text = "";
+    let answered = 0;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += value;
+      // Only whole events: a chunk can end in the middle of one.
+      const events = await readEvents(new Response(text.slice(0, text.lastIndexOf("\n\n") + 2)));
+      const calls = events.filter((e) => e.type === "tool_call") as Array<{ id: string }>;
+      const id = (events[0] as { id: string }).id;
+      while (answered < calls.length) {
+        const answer = answers[answered]!;
+        await t.post(`/v1/conversations/${id}/tool-results`, { results: [{ id: calls[answered]!.id, ...answer }] });
+        answered++;
+      }
+    }
+    return readEvents(new Response(text));
+  }
+
+  it("checks proposed changes with the app first, and returns what doesn't fit to Claude", async () => {
+    const t = setup([
+      {
+        blocks: [{ type: "tool_use", name: "propose_changes", input: { changes: [{ find: "teh", replace: "the" }] } }],
+        stopReason: "tool_use",
+      },
+      {
+        blocks: [
+          {
+            type: "tool_use",
+            name: "propose_changes",
+            input: { changes: [{ find: "teh cat", replace: "the cat" }, { find: "teh mat", replace: "the mat" }] },
+          },
+        ],
+        stopReason: "tool_use",
+      },
+      { blocks: [{ type: "text", text: "Fixed both." }] },
+    ]);
+    const response = await t.post("/v1/conversations", { ...START, context: FORM, tools: { ...TOOLS, changes: "text" } });
+    const events = await answeringToolCalls(t, response, [
+      { content: 'Change 1: "teh" appears 2 times in the text.', isError: true },
+      { content: "All changes fit." },
+    ]);
+    expect(events).toContainEqual({
+      type: "activity",
+      activity: { kind: "lookup", label: "Checking the changes against your text" },
+    });
+    const calls = events.filter((e) => e.type === "tool_call");
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toMatchObject({ name: "propose_changes", input: { kind: "changes", changes: [{ find: "teh", replace: "the" }] } });
+    // Only the change set the app accepted becomes a card.
+    const cards = events.filter((e) => e.type === "action");
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ action: { kind: "changes", changes: [{ find: "teh cat" }, { find: "teh mat" }] } });
+    const second = t.requests[1]!.messages as Array<{ content: Array<Record<string, unknown>> }>;
+    expect(second.at(-1)!.content[0]).toMatchObject({ is_error: true, content: 'Change 1: "teh" appears 2 times in the text.' });
+    const third = t.requests[2]!.messages as Array<{ content: Array<Record<string, unknown>> }>;
+    expect(third.at(-1)!.content[0]!.content).toContain("Nothing has been created or sent yet");
+  });
+
+  it("checks a fill's shape before asking the app", async () => {
+    const t = setup([
+      {
+        blocks: [
+          {
+            type: "tool_use",
+            name: "propose_fill",
+            input: { fields: [{ field: "f1", value: "Ada" }, { field: "f1", value: "Ada L." }] },
+          },
+        ],
+        stopReason: "tool_use",
+      },
+      {
+        blocks: [{ type: "tool_use", name: "propose_changes", input: { changes: [{ find: "same", replace: "same" }] } }],
+        stopReason: "tool_use",
+      },
+      { blocks: [{ type: "text", text: "ok" }] },
+    ]);
+    const events = await readEvents(
+      await t.post("/v1/conversations", { ...START, context: FORM, tools: { ...TOOLS, changes: "text", fill: true } }),
+    );
+    // Neither reached the app.
+    expect(events.some((e) => e.type === "tool_call" || e.type === "action")).toBe(false);
+    const second = t.requests[1]!.messages as Array<{ content: Array<Record<string, unknown>> }>;
+    expect(second.at(-1)!.content[0]).toMatchObject({ is_error: true });
+    expect(String(second.at(-1)!.content[0]!.content)).toContain("f1 is listed twice");
+    const third = t.requests[2]!.messages as Array<{ content: Array<Record<string, unknown>> }>;
+    expect(String(third.at(-1)!.content[0]!.content)).toContain("replace is the same as find");
   });
 });

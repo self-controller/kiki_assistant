@@ -3,6 +3,11 @@
 // PlacePopup over D-Bus to learn the window's size and where the chat box sits in it.
 // When the hotkey is pressed, Kiki calls RememberSource; CaptureSource then takes a screenshot of that
 // window around the pointer, from the window's own pixels, so Kiki's popup on top of it doesn't show.
+// PasteToSource focuses that window again and types the paste shortcut, for Kiki's edit cards in apps
+// that don't take text over accessibility. FocusSource only focuses it (Kiki then selects the text a change
+// replaces, over accessibility, and pastes), and KeysToSource presses a few allowed shortcuts there, such as
+// Ctrl+H for Google Docs' Find and replace.
+import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
@@ -13,11 +18,11 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import {cropAround} from './crop.js';
-import {popupGeometry} from './placement.js';
+import {insideHitRect, popupGeometry} from './placement.js';
 
 Gio._promisify(Shell.Screenshot, 'composite_to_stream');
 
-const VERSION = 3;
+const VERSION = 7;
 const OBJECT_PATH = '/app/kiki/Shell';
 /** How long after PlacePopup the next window from that process counts as the popup. */
 const EXPECT_US = 5 * GLib.USEC_PER_SEC;
@@ -32,6 +37,20 @@ const INTERFACE = `<node>
       <arg type="i" direction="out" name="height"/>
       <arg type="i" direction="out" name="anchorY"/>
     </method>
+    <method name="MovePopup">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="u" direction="out" name="version"/>
+      <arg type="b" direction="out" name="moving"/>
+    </method>
+    <method name="SetHitRect">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="i" direction="in" name="width"/>
+      <arg type="i" direction="in" name="height"/>
+      <arg type="u" direction="out" name="version"/>
+      <arg type="b" direction="out" name="found"/>
+    </method>
     <method name="RememberSource">
       <arg type="u" direction="out" name="version"/>
       <arg type="b" direction="out" name="found"/>
@@ -42,14 +61,61 @@ const INTERFACE = `<node>
       <arg type="u" direction="out" name="version"/>
       <arg type="s" direction="out" name="path"/>
     </method>
+    <method name="PasteToSource">
+      <arg type="b" direction="in" name="terminal"/>
+      <arg type="u" direction="out" name="version"/>
+      <arg type="b" direction="out" name="pasted"/>
+    </method>
+    <method name="FocusSource">
+      <arg type="u" direction="out" name="version"/>
+      <arg type="b" direction="out" name="focused"/>
+    </method>
+    <method name="KeysToSource">
+      <arg type="as" direction="in" name="steps"/>
+      <arg type="u" direction="out" name="version"/>
+      <arg type="b" direction="out" name="done"/>
+    </method>
     <method name="Version">
       <arg type="u" direction="out" name="version"/>
     </method>
   </interface>
 </node>`;
 
+/** How often a popup that lets clicks through checks the pointer, besides when the cursor tracker says it moved. */
+const POINTER_POLL_MS = 100;
+
 /** Largest crop CaptureSource takes, in logical pixels. */
 const MAX_CROP = 4096;
+/** How long PasteToSource waits for the source window to take focus. */
+const FOCUS_WAIT_MS = 500;
+/** Time for the focused app to see the focus change before the keys arrive, and between keys. */
+const KEY_SETTLE_MS = 60;
+const KEY_GAP_MS = 15;
+/** Time for the app to act on one shortcut (open a dialog, move the cursor) before the next. */
+const STEP_GAP_MS = 120;
+
+/**
+ * The shortcuts KeysToSource presses, by name. Only these: whatever calls it can't type text, which goes
+ * through the clipboard and a paste instead.
+ */
+const KEY_STEPS = {
+    'ctrl+a': [Clutter.KEY_Control_L, Clutter.KEY_a],
+    'ctrl+f': [Clutter.KEY_Control_L, Clutter.KEY_f],
+    'ctrl+h': [Clutter.KEY_Control_L, Clutter.KEY_h],
+    'ctrl+v': [Clutter.KEY_Control_L, Clutter.KEY_v],
+    'ctrl+shift+v': [Clutter.KEY_Control_L, Clutter.KEY_Shift_L, Clutter.KEY_v],
+    'backspace': [Clutter.KEY_BackSpace],
+    'escape': [Clutter.KEY_Escape],
+    'enter': [Clutter.KEY_Return],
+    'tab': [Clutter.KEY_Tab],
+};
+
+const sleep = ms => new Promise(resolve => {
+    GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+        resolve();
+        return GLib.SOURCE_REMOVE;
+    });
+});
 
 /** Mutter 47+ lets the compositor set a new window's position before it first shows. */
 const HAS_CONFIGURE = GObject.signal_lookup('configure', Meta.Window.$gtype) !== 0;
@@ -62,6 +128,9 @@ class Popup {
         this._onGone = onGone;
         this._placed = false;
         this._shown = false;
+        /** The chat box, in window coordinates; the rest of the window lets clicks through. Null: all of it. */
+        this._hit = null;
+        this._reactive = true;
 
         if (HAS_CONFIGURE)
             window.connectObject('configure', (_window, config) => this._configure(config), this);
@@ -80,6 +149,40 @@ class Popup {
                 this);
         } else {
             window.connectObject('shown', () => this._firstFrame(), this);
+        }
+    }
+
+    get window() {
+        return this._window;
+    }
+
+    get hasHitRect() {
+        return this._hit !== null;
+    }
+
+    setHitRect(rect) {
+        this._hit = rect.width > 0 && rect.height > 0 ? rect : null;
+        this.updatePointer();
+    }
+
+    /**
+     * Takes clicks only while the pointer is over the chat box. Kiki stays open on top of other windows,
+     * and most of its window is transparent space above the box: clicks there go to the window below.
+     * Wayland apps set which part of a window takes input, but Electron doesn't, so this does it instead:
+     * Mutter sends the pointer to the actor it picks, and it doesn't pick actors that aren't reactive.
+     */
+    updatePointer() {
+        const [x, y] = global.get_pointer();
+        const reactive = !this._hit || insideHitRect({x, y}, rectOf(this._window.get_frame_rect()), this._hit);
+        if (reactive === this._reactive)
+            return;
+        this._reactive = reactive;
+        const actor = this._window.get_compositor_private();
+        if (actor) {
+            setReactive(actor, reactive);
+            // Mutter only picks again when something moves: without this, a click right after the pointer
+            // jumped onto the box (or off it) would still go to the window it was over before.
+            actor.queue_relayout();
         }
     }
 
@@ -116,6 +219,11 @@ class Popup {
     }
 
     destroy() {
+        if (!this._reactive) {
+            const actor = this._window.get_compositor_private();
+            if (actor)
+                setReactive(actor, true);
+        }
         this._actor?.disconnectObject(this);
         this._actor = null;
         this._window.disconnectObject(this);
@@ -129,8 +237,13 @@ export default class KikiExtension extends Extension {
         this._popups = new Set();
         this._service = Gio.DBusExportedObject.wrapJSObject(INTERFACE, {
             PlacePopup: (pid, cardHeight) => this._place(pid, cardHeight),
+            MovePopup: pid => [VERSION, this._move(pid)],
+            SetHitRect: (pid, x, y, width, height) => [VERSION, this._setHitRect(pid, {x, y, width, height})],
             RememberSource: () => [VERSION, this._rememberSource()],
             CaptureSourceAsync: (params, invocation) => this._captureSource(params, invocation),
+            PasteToSourceAsync: (params, invocation) => this._pasteToSource(params, invocation),
+            FocusSourceAsync: (params, invocation) => this._reply(invocation, () => this._focusSource()),
+            KeysToSourceAsync: ([steps], invocation) => this._reply(invocation, () => this._keysToSource(steps)),
             Version: () => VERSION,
         });
         this._service.export(Gio.DBus.session, OBJECT_PATH);
@@ -138,7 +251,10 @@ export default class KikiExtension extends Extension {
     }
 
     disable() {
+        this._stopTracking();
         this._forgetSource();
+        this._keyboard?.run_dispose();
+        this._keyboard = null;
         global.display.disconnectObject(this);
         for (const popup of [...this._popups])
             popup.destroy();
@@ -160,6 +276,69 @@ export default class KikiExtension extends Extension {
         return [VERSION, geometry.width, geometry.height, geometry.anchorY];
     }
 
+    /**
+     * Starts moving the popup with the pointer, for a press on the chat box's top edge or toolbar. Most
+     * of the window is transparent space above the box, and a move the app starts can't take the
+     * window's top above the top bar, so the box couldn't go higher than where it opened. This is
+     * GNOME's Super+drag move instead, which doesn't keep the window's top on screen.
+     */
+    _move(pid) {
+        const popup = [...this._popups].find(p => p.window.get_pid() === pid);
+        if (!popup)
+            return false;
+        const op = Meta.GrabOp.MOVING_UNCONSTRAINED;
+        const time = global.display.get_current_time_roundtrip();
+        try {
+            // GNOME 48+: the pointer's sprite.
+            const backend = global.stage.get_context().get_backend();
+            return popup.window.begin_grab_op(op, backend.get_pointer_sprite(global.stage), time, null);
+        } catch {
+            // GNOME 45 to 47: the pointer device and no touch sequence.
+            const pointer = Clutter.get_default_backend().get_default_seat().get_pointer();
+            return popup.window.begin_grab_op(op, pointer, null, time, null);
+        }
+    }
+
+    _setHitRect(pid, rect) {
+        const popup = [...this._popups].find(p => p.window.get_pid() === pid);
+        if (!popup)
+            return false;
+        popup.setHitRect(rect);
+        this._trackPointer();
+        return true;
+    }
+
+    /** Follows the pointer while a popup lets clicks through, so it takes them again over its chat box. */
+    _trackPointer() {
+        const needed = this._popups && [...this._popups].some(p => p.hasHitRect);
+        if (!needed) {
+            this._stopTracking();
+            return;
+        }
+        if (this._pointerTimer)
+            return;
+        const update = () => {
+            for (const popup of this._popups ?? [])
+                popup.updatePointer();
+        };
+        // The cursor tracker says when the pointer moves; a slow poll covers a missed move.
+        const tracker = global.backend?.get_cursor_tracker?.();
+        tracker?.connectObject('position-invalidated', update, this);
+        this._tracker = tracker ?? null;
+        this._pointerTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, POINTER_POLL_MS, () => {
+            update();
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _stopTracking() {
+        this._tracker?.disconnectObject(this);
+        this._tracker = null;
+        if (this._pointerTimer)
+            GLib.source_remove(this._pointerTimer);
+        this._pointerTimer = 0;
+    }
+
     /** Remembers the focused window and the pointer, for screenshots after Kiki's popup opens over them. */
     _rememberSource() {
         this._forgetSource();
@@ -175,6 +354,93 @@ export default class KikiExtension extends Extension {
     _forgetSource() {
         this._source?.window.disconnectObject(this);
         this._source = null;
+    }
+
+    async _pasteToSource([terminal], invocation) {
+        await this._reply(invocation, () => this._paste(terminal));
+    }
+
+    /** Answers a D-Bus call with (version, what `run` returned), or with its error. */
+    async _reply(invocation, run) {
+        try {
+            const result = await run();
+            invocation.return_value(new GLib.Variant('(ub)', [VERSION, result]));
+        } catch (e) {
+            invocation.return_dbus_error('org.freedesktop.DBus.Error.Failed', `${e}`);
+        }
+    }
+
+    /**
+     * Focuses the remembered window and types Ctrl+V (Ctrl+Shift+V in terminals), so what Kiki put on the
+     * clipboard goes in at its cursor. False when that window is gone or won't take focus.
+     */
+    async _paste(terminal) {
+        if (!await this._focusSource())
+            return false;
+        await this._press(KEY_STEPS[terminal ? 'ctrl+shift+v' : 'ctrl+v']);
+        return true;
+    }
+
+    /** Presses the named shortcuts in the remembered window, one after another. False if it won't take focus. */
+    async _keysToSource(steps) {
+        const unknown = steps.find(step => !Object.hasOwn(KEY_STEPS, step));
+        if (unknown !== undefined)
+            throw new Error(`Kiki doesn't press "${unknown}"`);
+        if (!await this._focusSource())
+            return false;
+        for (const [index, step] of steps.entries()) {
+            if (index > 0)
+                await sleep(STEP_GAP_MS);
+            // Focus can move (another window, the overview) while the app works: stop rather than type elsewhere.
+            if (!this._sourceReady(this._source?.window))
+                return false;
+            await this._press(KEY_STEPS[step]);
+        }
+        return true;
+    }
+
+    /** The keys go to the window only once it's focused and nothing of the shell's holds the keyboard. */
+    _sourceReady(window) {
+        return Boolean(window) && global.display.focus_window === window && !Main.overview.visible && Main.modalCount === 0;
+    }
+
+    /** Focuses the remembered window and waits until it takes the keyboard. False when it's gone or won't. */
+    async _focusSource() {
+        const window = this._source?.window;
+        if (!window)
+            return false;
+        if (this._sourceReady(window))
+            return true;
+        // The overview keeps the keyboard even while the window stays focused, and as it closes it focuses
+        // the window it was showing: close it first, so it can't take the focus back.
+        if (Main.overview.visible) {
+            Main.overview.hide();
+            for (let waited = 0; Main.overview.visible && waited < FOCUS_WAIT_MS; waited += 20)
+                await sleep(20);
+        }
+        Main.activateWindow(window);
+        for (let waited = 0; !this._sourceReady(window); waited += 20) {
+            if (waited >= FOCUS_WAIT_MS || this._source?.window !== window)
+                return false;
+            // Something else took the focus (a closing menu, a window that just mapped): ask again, once.
+            if (waited === FOCUS_WAIT_MS / 2 && global.display.focus_window !== window)
+                Main.activateWindow(window);
+            await sleep(20);
+        }
+        await sleep(KEY_SETTLE_MS);
+        return this._sourceReady(window);
+    }
+
+    /** Presses `keys` together, in order, and lets them go in reverse. */
+    async _press(keys) {
+        this._keyboard ??= Clutter.get_default_backend().get_default_seat()
+            .create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
+        for (const [state, order] of [[Clutter.KeyState.PRESSED, keys], [Clutter.KeyState.RELEASED, [...keys].reverse()]]) {
+            for (const key of order) {
+                this._keyboard.notify_keyval(GLib.get_monotonic_time(), key, state);
+                await sleep(KEY_GAP_MS);
+            }
+        }
     }
 
     async _captureSource([maxWidth, maxHeight], invocation) {
@@ -232,10 +498,20 @@ export default class KikiExtension extends Extension {
         this._expected.delete(pid);
         if (GLib.get_monotonic_time() > expected.until)
             return;
-        this._popups.add(new Popup(window, expected.position, popup => this._popups?.delete(popup)));
+        this._popups.add(new Popup(window, expected.position, popup => {
+            this._popups?.delete(popup);
+            this._trackPointer();
+        }));
     }
 }
 
 function rectOf(rect) {
     return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
+}
+
+/** Makes a window's actor and its surfaces (which pick themselves) take the pointer, or not. */
+function setReactive(actor, reactive) {
+    actor.reactive = reactive;
+    for (const child of actor.get_children())
+        setReactive(child, reactive);
 }

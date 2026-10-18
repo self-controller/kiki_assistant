@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { clipboard, ClipboardItem, desktopCapturer, screen, systemPreferences, type ClipboardBookmark } from "electron";
+import { clipboard, desktopCapturer, screen, systemPreferences } from "electron";
 import type { ScreenshotPolicy } from "../../shared-types.ts";
-import { toScreenshot, type Capture } from "./common.ts";
+import { keepClipboard } from "../clipboard.ts";
+import { toScreenshot, type EditTarget, type RawCapture } from "./common.ts";
 
 // NOTE: written against the macOS Accessibility and System Events APIs but not yet
 // tested on a Mac. See the README's macOS checklist.
@@ -16,39 +17,45 @@ function jxa(script: string, timeoutMs = 2_000): Promise<string> {
 const FRONT_APP_SCRIPT = `
 const se = Application("System Events");
 const proc = se.processes.whose({ frontmost: true })[0];
-const out = { appName: "", windowTitle: "", selection: "" };
+const out = { appName: "", windowTitle: "", selection: "", pid: 0, role: "" };
 try { out.appName = proc.name(); } catch (e) {}
+try { out.pid = proc.unixId(); } catch (e) {}
 try { out.windowTitle = proc.windows[0].name() || ""; } catch (e) {}
 try {
   const focused = proc.attributes.byName("AXFocusedUIElement").value();
+  try { out.role = focused.role() || ""; } catch (e) {}
   out.selection = focused.attributes.byName("AXSelectedText").value() || "";
 } catch (e) {}
 JSON.stringify(out);
 `;
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/** Focused elements that take typed text, so a paste goes in at their cursor. */
+const TEXT_ROLES = new Set(["AXTextField", "AXTextArea", "AXComboBox"]);
+const TERMINALS = new Set(["Terminal", "iTerm2", "Ghostty", "WezTerm", "Alacritty", "kitty", "Warp"]);
 
-/** Reads every format on the clipboard now, so it can be put back later. */
-async function snapshotClipboard(): Promise<ClipboardItem[]> {
-  const items = await clipboard.read();
-  return Promise.all(
-    items.map(async (item) => {
-      const entries: Record<string, Blob | ClipboardBookmark> = {};
-      for (const type of item.types) {
-        try {
-          entries[type] = await item.getType(type);
-        } catch {
-          // Skip formats that can't be read back.
-        }
-      }
-      return new ClipboardItem(entries);
-    }),
-  );
+interface FrontApp {
+  appName: string;
+  windowTitle: string;
+  selection: string;
+  pid: number;
+  /** The focused element's accessibility role, e.g. "AXTextArea". */
+  role: string;
 }
+
+/** Where an edit card pastes: the focused text field of the front app, brought back to the front. */
+function macEditTarget(front: FrontApp, selection: string): EditTarget | undefined {
+  if (!front.pid || !TEXT_ROLES.has(front.role)) return undefined;
+  // What's highlighted in a terminal is its output: text goes in at the prompt.
+  const terminal = TERMINALS.has(front.appName);
+  const original = terminal ? "" : selection;
+  return { mode: original ? "replace" : "insert", original, kind: terminal ? "terminal" : "field", macPid: front.pid };
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Copies the selection with Cmd+C, then restores whatever was on the clipboard. */
 async function copySelection(): Promise<string> {
-  const saved = await snapshotClipboard().catch(() => []);
+  const restore = await keepClipboard();
   const marker = `kiki-${Date.now()}`;
   await clipboard.writeText(marker);
   let copied = "";
@@ -60,8 +67,7 @@ async function copySelection(): Promise<string> {
       if (now !== marker) copied = now;
     }
   } finally {
-    if (saved.length > 0) await clipboard.write(saved).catch(() => clipboard.clear());
-    else clipboard.clear();
+    await restore();
   }
   return copied;
 }
@@ -76,16 +82,16 @@ async function screenUnderCursor() {
   return source ? toScreenshot(source.thumbnail) : undefined;
 }
 
-export async function captureMac(policy: ScreenshotPolicy): Promise<Capture> {
+export async function captureMac(policy: ScreenshotPolicy): Promise<RawCapture> {
   const notes: string[] = [];
   if (!systemPreferences.isTrustedAccessibilityClient(false)) {
     notes.push("Give Kiki Accessibility access in Settings so it can read the selected text.");
     return { selection: "", notes };
   }
 
-  let front = { appName: "", windowTitle: "", selection: "" };
+  let front: FrontApp = { appName: "", windowTitle: "", selection: "", pid: 0, role: "" };
   try {
-    front = JSON.parse(await jxa(FRONT_APP_SCRIPT)) as typeof front;
+    front = JSON.parse(await jxa(FRONT_APP_SCRIPT)) as FrontApp;
   } catch (error) {
     console.warn("[kiki] front app script:", error);
   }
@@ -93,19 +99,42 @@ export async function captureMac(policy: ScreenshotPolicy): Promise<Capture> {
   const selection = front.selection || (await copySelection().catch(() => ""));
 
   let screenshot;
+  let takeScreenshot;
   if (policy !== "never") {
     if (systemPreferences.getMediaAccessStatus("screen") === "granted") {
-      screenshot = await screenUnderCursor().catch(() => undefined);
+      // Taken later from the camera button, it also shows Kiki's popup.
+      if (policy === "always") screenshot = await screenUnderCursor().catch(() => undefined);
+      else takeScreenshot = screenUnderCursor;
     } else {
       notes.push("Give Kiki Screen Recording access in Settings so it can see the page around your selection.");
     }
   }
 
+  const editTarget = macEditTarget(front, selection);
   return {
     selection,
+    ...(editTarget ? { editTarget } : {}),
     appName: front.appName || undefined,
     windowTitle: front.windowTitle || undefined,
     screenshot,
+    takeScreenshot,
     notes,
   };
+}
+
+/** Brings the app with `pid` back to the front and types Cmd+V in it. False when it isn't running. */
+export async function pasteIntoApp(pid: number): Promise<boolean> {
+  try {
+    await jxa(
+      `const se = Application("System Events");
+const proc = se.processes.whose({ unixId: ${Math.trunc(pid)} })[0];
+proc.frontmost = true;
+delay(0.15);
+se.keystroke("v", { using: "command down" });`,
+      3_000,
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }

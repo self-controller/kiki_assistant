@@ -70,7 +70,7 @@
         <label>
           <span>Screenshot</span>
           <select id="screenshot">
-            <option value="auto">Only when the window's text isn't available</option>
+            <option value="button">When I press the camera button</option>
             <option value="always">Always attach one</option>
             <option value="never">Never</option>
           </select>
@@ -98,6 +98,41 @@
             Accessibility lets Kiki read the selected text. Screen Recording lets it see the page around it.
           </p>
         </div>
+      </section>
+
+      <section id="accounts" hidden>
+        <h2>Connected accounts</h2>
+        <div class="row">
+          <button id="google" type="button">Connect Google</button>
+          <span id="googleStatus" class="hint" role="status"></span>
+        </div>
+        <p class="hint">
+          Lets Kiki add events to Google Calendar, add tasks, save Gmail drafts and send emails, each only after you
+          approve its card, and check your calendar and tasks when you ask. Kiki never reads your email. Your
+          Google sign-in stays on this computer and never goes to the Kiki server.
+        </p>
+      </section>
+
+      <section>
+        <h2>Personality</h2>
+        <label>
+          <span>Kiki talks</span>
+          <select id="personality">
+            <option value="default">In its usual voice</option>
+            <option value="existentialist">Like Camus, Dostoevsky and Nietzsche</option>
+            <option value="custom">My own way…</option>
+          </select>
+        </label>
+        <label id="customWrap" hidden>
+          <span>Your prompt</span>
+          <textarea
+            id="customPersonality"
+            rows="4"
+            maxlength="2000"
+            placeholder="Describe how Kiki should talk, e.g. “Answer like a patient tutor, with one example.”"
+          ></textarea>
+        </label>
+        <p class="hint">Applies to new conversations. Your prompt is sent to your Kiki server with each one.</p>
       </section>
 
       <section>

@@ -8,7 +8,9 @@ export type FakeBlock =
   | { type: "server_tool_use"; name: "web_search"; query: string }
   | { type: "server_tool_use"; name: "web_fetch"; url: string }
   | { type: "web_search_tool_result"; results: Array<{ url: string; title: string }> }
-  | { type: "web_fetch_tool_result"; url: string; title: string };
+  | { type: "web_fetch_tool_result"; url: string; title: string }
+  /** A client tool call (Kiki's own tools); its id is `toolu_<index>`. */
+  | { type: "tool_use"; name: string; input: Record<string, unknown> };
 
 export interface FakeTurn {
   blocks: FakeBlock[];
@@ -80,6 +82,17 @@ export function sseEvents(turn: FakeTurn, id: string, chunkChars?: number): obje
         type: "content_block_delta",
         index,
         delta: { type: "input_json_delta", partial_json: JSON.stringify(input) },
+      });
+    } else if (block.type === "tool_use") {
+      events.push({
+        type: "content_block_start",
+        index,
+        content_block: { type: "tool_use", id: `toolu_${index}`, name: block.name, input: {} },
+      });
+      events.push({
+        type: "content_block_delta",
+        index,
+        delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) },
       });
     } else if (block.type === "web_fetch_tool_result") {
       events.push({

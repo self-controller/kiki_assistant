@@ -2,7 +2,9 @@
 // without an API key. Answers stream slowly and echo back what context arrived.
 //   npm run mock -w server
 // Every answer "thinks" first; questions mentioning "latest" or "search" (or sent with the Search toggle)
-// get a fake web search and page read. Voice questions get a canned transcript.
+// get a fake web search and page read. Voice questions get a canned transcript. Questions about the
+// calendar, reminders or email get action cards; "am I free" checks the calendar through the app. "typos"
+// proposes changes to the text at the cursor (upper-casing a few words), and "fill" fills the form.
 import Anthropic from "@anthropic-ai/sdk";
 import { serve } from "@hono/node-server";
 import { createApp } from "../src/app.ts";
@@ -29,13 +31,124 @@ function tag(text: string, name: string): string | undefined {
   return new RegExp(`<${name}>\\n([\\s\\S]*?)\\n</${name}>`).exec(text)?.[1];
 }
 
+/** The tool results the app (or the server, for cards) sent back, if the last message is one. */
+function toolResults(body: { messages: Array<{ role: string; content: unknown }> }): string[] {
+  const last = body.messages.at(-1);
+  const blocks = Array.isArray(last?.content) ? (last.content as Array<{ type: string; content?: unknown }>) : [];
+  return blocks.filter((b) => b.type === "tool_result").map((b) => String(b.content ?? ""));
+}
+
+/** A few changes to `text`: up to three words that appear once in it, upper-cased. */
+function mockChanges(text: string | undefined): Array<{ find: string; replace: string }> {
+  const words = [...new Set((text ?? "teh").match(/\p{L}{3,}/gu) ?? [])];
+  const once = words.filter((word) => text === undefined || text.split(word).length === 2).slice(0, 3);
+  return (once.length ? once : ["teh"]).map((word) => ({ find: word, replace: word.toUpperCase() }));
+}
+
+/** Values for each field in <form_fields>: "Mock <label>" in text fields, check boxes checked. */
+function mockFill(fields: string | undefined): Array<{ field: string; value: string | boolean }> {
+  return (fields ?? "").split("\n").flatMap((line) => {
+    const match = /^(f\d+) (\w+) ("(?:[^"\\]|\\.)*")/.exec(line);
+    if (!match) return [];
+    const [, id, kind, label] = match;
+    return [{ field: id!, value: kind === "checkbox" || kind === "radio" ? true : `Mock ${JSON.parse(label!) as string}` }];
+  });
+}
+
+/** Cards, calendar checks and opened searches, when the question asks for them and the app handles them. */
+function actionTurn(question: string, tools: string[], text: string): FakeTurn | null {
+  const highlighted = tag(text, "highlighted");
+  const note: FakeTurn["blocks"][number] = { type: "text", text: "Next Tuesday is Oct 20, so I'll use that." };
+  if (/google images|youtube|open .*search/i.test(question) && tools.includes("open_search")) {
+    const where = /youtube/i.test(question) ? "videos" : /images/i.test(question) ? "images" : "web";
+    return {
+      stopReason: "tool_use",
+      blocks: [{ type: "tool_use", name: "open_search", input: { where, query: "cute puppies" } }],
+    };
+  }
+  if (/typo|changes|everywhere/i.test(question) && tools.includes("propose_changes")) {
+    const changes = mockChanges(tag(text, "editable_text") ?? tag(text, "nearby_text"));
+    return { stopReason: "tool_use", blocks: [{ type: "tool_use", name: "propose_changes", input: { changes } }] };
+  }
+  if (/fill|form/i.test(question) && tools.includes("propose_fill")) {
+    const fields = mockFill(tag(text, "form_fields"));
+    if (fields.length) return { stopReason: "tool_use", blocks: [{ type: "tool_use", name: "propose_fill", input: { fields } }] };
+  }
+  if (/free|busy/i.test(question) && tools.includes("list_calendar_events")) {
+    return {
+      stopReason: "tool_use",
+      blocks: [
+        note,
+        { type: "tool_use", name: "list_calendar_events", input: { time_min: "2026-10-22T12:00", time_max: "2026-10-22T18:00" } },
+      ],
+    };
+  }
+  if (/rewrite|fix|edit|write|translate/i.test(question) && tools.includes("propose_edit")) {
+    return {
+      stopReason: "tool_use",
+      blocks: [
+        {
+          type: "tool_use",
+          name: "propose_edit",
+          input: { text: highlighted ? `${highlighted.trim()} (edited by the mock server)` : "Written by the mock server." },
+        },
+      ],
+    };
+  }
+  if (!tools.includes("propose_calendar_event")) return null;
+  if (/calendar|schedule/i.test(question)) {
+    return {
+      stopReason: "tool_use",
+      blocks: [
+        note,
+        {
+          type: "tool_use",
+          name: "propose_calendar_event",
+          input: { title: "Lunch with Sam", start: "2026-10-20T13:00", location: "Café Olimpico", attendees: ["sam@example.com"] },
+        },
+      ],
+    };
+  }
+  if (/remind|task|todo/i.test(question)) {
+    return {
+      stopReason: "tool_use",
+      blocks: [{ type: "tool_use", name: "propose_task", input: { title: "Renew passport", due: "2026-10-30", notes: "Deadline Nov 1." } }],
+    };
+  }
+  if (/email|reply|send/i.test(question)) {
+    return {
+      stopReason: "tool_use",
+      blocks: [
+        {
+          type: "tool_use",
+          name: "propose_email",
+          input: {
+            to: ["sam@example.com"],
+            subject: "Re: Lunch?",
+            body: "Hi Sam,\n\nSounds great, see you Tuesday at 1pm.\n\nThanks",
+            send: /send/i.test(question),
+          },
+        },
+      ],
+    };
+  }
+  return null;
+}
+
 function answerFor(body: {
   messages: Array<{ role: string; content: unknown }>;
   output_config?: { effort?: string };
+  tools?: Array<{ name: string }>;
 }): FakeTurn {
+  const results = toolResults(body);
+  if (results.length > 0) {
+    return { blocks: [{ type: "text", text: `**Mock answer** after Kiki's tools.\n\n> ${results.join("\n> ").slice(0, 400)}` }] };
+  }
   const text = lastUserText(body);
   const question = tag(text, "question") ?? text;
   const turns = body.messages.filter((m) => m.role === "user").length;
+  const action = actionTurn(question, (body.tools ?? []).map((tool) => tool.name), text);
+  if (action) return action;
   const report =
     turns === 1
       ? [

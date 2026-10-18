@@ -11,19 +11,28 @@
   </head>
   <body>
     <div id="popup" class="popup">
-      <div class="mascot" title="Drag to move Kiki" aria-hidden="true">
-        <svg viewBox="0 0 44 38" width="44" height="38">
+      <button
+        id="mascot"
+        class="mascot"
+        type="button"
+        aria-label="Past sessions"
+        aria-expanded="false"
+        aria-controls="history"
+      >
+        <svg viewBox="0 0 44 38" width="44" height="38" aria-hidden="true">
           <path class="mascot-body" d="M22 4 L40 34 L4 34 Z" />
           <g class="mascot-eyes">
             <circle class="eye" cx="17.5" cy="25" r="2.4" />
             <circle class="eye" cx="26.5" cy="25" r="2.4" />
           </g>
         </svg>
-      </div>
+      </button>
+      <button id="close" class="close" type="button" aria-label="Close" title="Close (Esc)"></button>
       <section id="card" class="card" aria-label="Kiki">
-        <button id="close" class="close" type="button" aria-label="Close" title="Close (Esc)"></button>
+        <div class="grip" aria-hidden="true"></div>
         <div id="thread" class="thread" aria-live="polite">
           <div id="threadContent" class="thread-content"></div>
+          <div id="history" class="history" aria-label="Past sessions"></div>
         </div>
         <form id="composer" class="composer">
           <div id="context" class="context">

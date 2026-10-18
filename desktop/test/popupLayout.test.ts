@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { cardBottomIn, INSETS, popupGeometry } from "../resources/gnome-extension/kiki-popup@kiki.app/placement.js";
+import {
+  cardBottomIn,
+  insideHitRect,
+  INSETS,
+  popupGeometry,
+} from "../resources/gnome-extension/kiki-popup@kiki.app/placement.js";
 import { formatSeconds, paragraphs, thoughtLine } from "../src/renderer/feed.ts";
 import { POPUP_WIDTH, springStep, type Spring } from "../src/renderer/layout.ts";
 
@@ -135,5 +140,25 @@ describe("thinking feed text", () => {
     expect(formatSeconds(400)).toBe("1s");
     expect(formatSeconds(6_200)).toBe("6s");
     expect(formatSeconds(75_000)).toBe("1m 15s");
+  });
+});
+
+describe("popup click-through", () => {
+  // The window at (100, 50); the chat box (with Kiki and its ✕) at (16, 300) in it, 440×200.
+  const frame = { x: 100, y: 50, width: 472, height: 600 };
+  const hit = { x: 16, y: 300, width: 440, height: 200 };
+
+  it("takes clicks over the chat box", () => {
+    expect(insideHitRect({ x: 116, y: 350 }, frame, hit)).toBe(true);
+    expect(insideHitRect({ x: 556, y: 550 }, frame, hit)).toBe(true);
+  });
+
+  it("lets clicks on the transparent space around it through", () => {
+    // Above the box, in the window's transparent top.
+    expect(insideHitRect({ x: 300, y: 200 }, frame, hit)).toBe(false);
+    // Left of the box, inside the window's inset.
+    expect(insideHitRect({ x: 105, y: 400 }, frame, hit)).toBe(false);
+    // Outside the window.
+    expect(insideHitRect({ x: 20, y: 400 }, frame, hit)).toBe(false);
   });
 });

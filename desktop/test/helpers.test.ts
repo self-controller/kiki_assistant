@@ -41,6 +41,21 @@ describe("trimAround", () => {
   it("falls back to the start when the selection isn't found", () => {
     expect(trimAround(text, "missing", 10)).toBe("aaaaaaaaaa…");
   });
+
+  it("centers on what was on screen when nothing is selected", () => {
+    const page = "a".repeat(1000) + "SHOWN" + "b".repeat(1000);
+    expect(trimAround(page, "", 11, 1002)).toBe("…aaaSHOWNbbb…");
+    expect(trimAround(page, "missing", 11, 1002)).toBe("…aaaSHOWNbbb…");
+  });
+
+  it("prefers the selection over what was on screen", () => {
+    expect(trimAround(text, "NEEDLE", 106, 0)).toBe(trimAround(text, "NEEDLE", 106));
+  });
+
+  it("keeps the window inside the text when the focus is near an end", () => {
+    expect(trimAround(text, "", 10, 2)).toBe("aaaaaaaaaa…");
+    expect(trimAround(text, "", 10, text.length - 1)).toBe("…bbbbbbbbbb");
+  });
 });
 
 describe("validateServerUrl", () => {

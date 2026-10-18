@@ -95,6 +95,10 @@ export interface PopupPlacement {
   width: number;
   height: number;
   anchorY: number;
+  /** Whether the extension moves the popup itself (`movePopup`, version 4). */
+  shellMove: boolean;
+  /** Whether the extension lets clicks outside the chat box through (`setHitRect`, version 5). */
+  clickThrough: boolean;
 }
 
 /**
@@ -105,11 +109,43 @@ export async function placePopup(cardHeight: number): Promise<PopupPlacement | n
   try {
     // "(uint32 2, 472, 616, 412)"
     const out = await callExtension(500, "PlacePopup", String(process.pid), String(Math.round(cardHeight)));
-    const [, width, height, anchorY] = (out.match(/(?<!\w)-?\d+/g) ?? []).map(Number);
+    const [version = 0, width, height, anchorY] = (out.match(/(?<!\w)-?\d+/g) ?? []).map(Number);
     if (!width || !height || anchorY === undefined) return null;
-    return { width, height, anchorY };
+    return { width, height, anchorY, shellMove: version >= 4, clickThrough: version >= 5 };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Has Kiki's GNOME extension move the popup with the pointer, while the button is down. Unlike a move
+ * the window starts itself, it can take the window's transparent top above the top bar.
+ */
+export async function movePopup(): Promise<boolean> {
+  try {
+    // "(uint32 4, true)"
+    return (await callExtension(500, "MovePopup", String(process.pid))).includes("true");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Tells Kiki's GNOME extension where the chat box is in the popup window. The extension then lets the
+ * window take clicks only there; clicks on the transparent space around the box go to the window below.
+ */
+export async function setHitRect(rect: { x: number; y: number; width: number; height: number }): Promise<boolean> {
+  try {
+    // "(uint32 5, true)"
+    const out = await callExtension(
+      500,
+      "SetHitRect",
+      String(process.pid),
+      ...[rect.x, rect.y, rect.width, rect.height].map((value) => String(Math.round(value))),
+    );
+    return out.includes("true");
+  } catch {
+    return false;
   }
 }
 

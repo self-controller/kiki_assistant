@@ -1,6 +1,7 @@
 import { app, ipcMain, shell, systemPreferences, type BrowserWindow } from "electron";
 import type { ActionResult, ScreenshotPolicy, SettingsUpdate, SettingsView } from "../shared-types.ts";
 import { fetchMe } from "./api.ts";
+import { connectGoogle, disconnectGoogle, googleAccount, googleAvailable } from "./google/oauth.ts";
 import { registerHotkey } from "./hotkey.ts";
 import {
   enableAccessibility,
@@ -15,7 +16,7 @@ import { createWindow } from "./windows.ts";
 
 const isLinux = process.platform === "linux";
 const isMac = process.platform === "darwin";
-const SCREENSHOT_POLICIES: ScreenshotPolicy[] = ["auto", "always", "never"];
+const SCREENSHOT_POLICIES: ScreenshotPolicy[] = ["button", "always", "never"];
 
 let settingsWindow: BrowserWindow | null = null;
 let hotkeyError: string | undefined;
@@ -54,6 +55,7 @@ async function view(): Promise<SettingsView> {
     platform: process.platform,
     storageWarning: storageWarning(),
     hotkeyError,
+    google: { available: googleAvailable(), ...googleAccount() },
     linux: isLinux ? await linuxStatus() : undefined,
     mac: isMac
       ? {
@@ -143,6 +145,19 @@ export function registerSettingsIpc(): void {
         ? "Accessibility is on. Allow Screen Recording if it's still off, then reopen Settings."
         : "Allow Kiki in System Settings → Privacy & Security → Accessibility, then reopen Settings.",
     };
+  });
+  ipcMain.handle("settings:connectGoogle", async (): Promise<ActionResult> => {
+    try {
+      const tokens = await connectGoogle();
+      settingsWindow?.focus();
+      return { ok: true, message: tokens.email ? `Connected as ${tokens.email}.` : "Connected." };
+    } catch (error) {
+      return { ok: false, message: String(error instanceof Error ? error.message : error) };
+    }
+  });
+  ipcMain.handle("settings:disconnectGoogle", async (): Promise<ActionResult> => {
+    await disconnectGoogle();
+    return { ok: true, message: "Disconnected." };
   });
   ipcMain.on("settings:quit", () => app.quit());
 }

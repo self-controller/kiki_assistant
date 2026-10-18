@@ -1,4 +1,4 @@
-import type { ErrorResponse, KikiEvent, MeResponse } from "@kiki/shared";
+import { LIMITS, type ErrorResponse, type KikiEvent, type MeResponse, type ToolResult } from "@kiki/shared";
 import { EventSourceParserStream } from "eventsource-parser/stream";
 import type { TestResult } from "../shared-types.ts";
 import { getAccessCode, getSettings } from "./settings.ts";
@@ -94,5 +94,22 @@ export async function fetchMe(): Promise<TestResult> {
     return { ok: true, me };
   } catch {
     return { ok: false, message: unreachable(conn.base).message };
+  }
+}
+
+/** Answers a streaming turn's `tool_call`. The turn carries on (or times out) either way, so failures are ignored. */
+export async function postToolResults(conversationId: string, results: ToolResult[]): Promise<void> {
+  const conn = connection();
+  if (!conn) return;
+  const body = { results: results.map((result) => ({ ...result, content: result.content.slice(0, LIMITS.toolResultChars) })) };
+  try {
+    await fetch(`${conn.base}/v1/conversations/${encodeURIComponent(conversationId)}/tool-results`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${conn.code}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch {
+    // The server gives Claude an error result after its timeout.
   }
 }

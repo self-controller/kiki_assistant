@@ -46,3 +46,13 @@ export function popupGeometry(pointer, cardHeight, workArea) {
 export function cardBottomIn(anchorY, cardHeight, windowHeight) {
   return Math.min(Math.max(anchorY, INSETS.top + cardHeight), windowHeight - INSETS.bottom);
 }
+
+/**
+ * Whether `pointer` (screen coordinates) is over the part of the popup that takes clicks: `hit`, in the
+ * coordinates of a window whose frame is `frame`. A pixel of slop keeps the box's edge clickable.
+ */
+export function insideHitRect(pointer, frame, hit) {
+  const x = pointer.x - frame.x;
+  const y = pointer.y - frame.y;
+  return x >= hit.x - 1 && x <= hit.x + hit.width + 1 && y >= hit.y - 1 && y <= hit.y + hit.height + 1;
+}

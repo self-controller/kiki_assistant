@@ -53,7 +53,8 @@ label.check {
 input[type="url"],
 input[type="text"],
 input[type="password"],
-select {
+select,
+textarea {
   padding: 7px 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -61,8 +62,14 @@ select {
   font-weight: 400;
 }
 
+textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+
 input:focus,
-select:focus {
+select:focus,
+textarea:focus {
   outline: none;
   border-color: var(--accent);
 }

@@ -1,4 +1,4 @@
-// The "Thinking…" feed above an answer: what Kiki thinks, searches and reads while it works,
+// The "Thinking…" feed above an answer: what Kiki thinks, searches, reads and opens while it works,
 // collapsing to one line ("Thought for 6s · 2 searches · 5 sources") once the answer starts.
 import type { Activity, Source } from "@kiki/shared";
 import { formatSeconds, hostOf, paragraphs, plural, thoughtLine } from "./feed.ts";
@@ -33,7 +33,7 @@ export class Trace {
   readonly #earlier = el("li", "line earlier");
   readonly #full = el("div", "thinking-full");
   readonly #started = Date.now();
-  readonly #timer: number;
+  #timer: number;
   /** Feed lines in order; a thought line follows one paragraph of the thinking text. */
   readonly #lines: Array<{ node: HTMLLIElement; paragraph?: number }> = [];
   readonly #reads = new Map<string, HTMLLIElement>();
@@ -104,6 +104,20 @@ export class Trace {
       case "read":
         this.#addRead(activity.url, activity.title);
         break;
+      case "lookup": {
+        const line = this.#line("lookup", icon(activity.label.includes("task") ? "listTodo" : "calendar", 12));
+        line.append(el("span", "line-text", activity.label));
+        this.onChange();
+        break;
+      }
+      case "open": {
+        const line = this.#line("open", icon("globe", 12));
+        const text = el("span", "line-text", `Opening ${activity.label} for `);
+        text.append(el("q", undefined, activity.query));
+        line.append(text);
+        this.onChange();
+        break;
+      }
     }
   }
 
@@ -190,6 +204,20 @@ export class Trace {
 
   #tick(): void {
     if (!this.#finished) this.#meta.textContent = formatSeconds(Date.now() - this.#started);
+  }
+
+  /** Kiki went back to work after it seemed to start answering: the feed goes live again. */
+  resume(): void {
+    if (!this.#finished) return;
+    this.#finished = false;
+    this.root.classList.remove("open");
+    this.root.classList.replace("done", "live");
+    this.#head.setAttribute("aria-expanded", "false");
+    this.#full.hidden = true;
+    this.#title.set(PHASE_TITLES.thinking);
+    this.#timer = window.setInterval(() => this.#tick(), 1000);
+    this.#layout();
+    this.onChange();
   }
 
   /** The answer has started (or the turn ended): fold the feed into its summary line. */

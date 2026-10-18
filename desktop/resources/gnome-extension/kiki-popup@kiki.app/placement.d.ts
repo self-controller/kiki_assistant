@@ -26,3 +26,5 @@ export function maxCardHeight(workAreaHeight: number): number;
 export function popupGeometry(pointer: Point, cardHeight: number, workArea: Rect): PopupGeometry;
 
 export function cardBottomIn(anchorY: number, cardHeight: number, windowHeight: number): number;
+
+export function insideHitRect(pointer: Point, frame: Rect, hit: Rect): boolean;

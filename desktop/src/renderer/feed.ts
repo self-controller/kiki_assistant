@@ -1,4 +1,4 @@
-// Text helpers for the popup's thinking feed. Pure functions, so they're testable.
+// Text helpers for the popup's thinking feed and past sessions. Pure functions, so they're testable.
 
 export function hostOf(url: string): string {
   try {
@@ -46,4 +46,21 @@ export function plural(count: number, one: string, many = `${one}s`): string {
 export function formatSeconds(ms: number): string {
   const seconds = Math.max(1, Math.round(ms / 1000));
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const monthDay = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" });
+const monthDayYear = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" });
+
+/** When a session was last used: "Just now", "5m ago", "2h ago", "Yesterday", "Oct 9", "Oct 9, 2025". */
+export function formatWhen(time: number, now: number): string {
+  const ago = now - time;
+  if (ago < 60_000) return "Just now";
+  if (ago < 60 * 60_000) return `${Math.floor(ago / 60_000)}m ago`;
+  const today = new Date(now).setHours(0, 0, 0, 0);
+  if (time >= today) return `${Math.floor(ago / (60 * 60_000))}h ago`;
+  if (time >= today - DAY_MS) return "Yesterday";
+  return new Date(time).getFullYear() === new Date(now).getFullYear()
+    ? monthDay.format(time)
+    : monthDayYear.format(time);
 }

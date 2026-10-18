@@ -6,8 +6,16 @@ import { promisify } from "node:util";
 import { app, clipboard, nativeImage } from "electron";
 import type { Screenshot } from "@kiki/shared";
 import type { ScreenshotPolicy } from "../../shared-types.ts";
-import { captureSource, rememberSource } from "../gnomeShell.ts";
-import { AUTO_SCREENSHOT_MIN_TEXT, toScreenshot, type Capture, type Vicinity } from "./common.ts";
+import type { FieldKind } from "@kiki/shared";
+import { captureSource, KEYS_VERSION, PASTE_VERSION, rememberSource } from "../gnomeShell.ts";
+import {
+  toScreenshot,
+  type EditTarget,
+  type FormTarget,
+  type PageText,
+  type RawCapture,
+  type Vicinity,
+} from "./common.ts";
 
 const run = promisify(execFile);
 
@@ -33,6 +41,44 @@ interface HelperContext {
   truncated?: boolean;
   /** Set for terminals and editors (source "terminal"/"editor"), instead of `text`. */
   vicinity?: Vicinity;
+  /** Where `text` is scrolled to; see PageText. */
+  focus?: number;
+  /** The text object at the cursor, when it's editable or a terminal. */
+  edit?: HelperEdit;
+  /** The app's process and toolkit ("gtk", "gecko", "chromium"...). */
+  pid?: number | null;
+  toolkit?: string;
+  /** A browser page's address. */
+  url?: string;
+  /** Fields a form fill could set, when the page or window has at least two. */
+  fields?: HelperField[];
+}
+
+interface HelperField {
+  path: number[];
+  role?: string | null;
+  label: string;
+  kind: FieldKind;
+  onScreen: boolean;
+  value?: string;
+  length?: number;
+  checked?: boolean;
+}
+
+interface HelperEdit {
+  pid: number | null;
+  path: number[];
+  role?: string | null;
+  start: number;
+  end: number;
+  /** The text at start..end: what an edit replaces. */
+  expected: string;
+  /** AT-SPI can write there; otherwise only a paste can. */
+  editable: boolean;
+  kind: "terminal" | "editor" | "field";
+  toolkit?: string;
+  /** The whole text (rich text flattened), for changes in several places; not for terminals or editors. */
+  full?: { text: string; truncated?: boolean };
 }
 
 interface ScreenshotResult {
@@ -120,6 +166,87 @@ async function portalScreenshot(): Promise<ScreenshotResult> {
   }
 }
 
+/**
+ * Toolkits whose AT-SPI text writes do nothing (Firefox and Zen: verified) or aren't known to work (Chromium,
+ * Electron). Kiki selects the text there over AT-SPI and pastes over it.
+ */
+const SELECT_PASTE_TOOLKITS = new Set(["gecko", "chromium"]);
+const GOOGLE_DOC = /^https:\/\/docs\.google\.com\/document\/d\//;
+
+/**
+ * Where an edit card can write in the window the hotkey was pressed in: the editable text at its cursor
+ * (directly over AT-SPI, by selecting it and pasting, or with a paste at the cursor), or, in an app that
+ * shares no text at all (VS Code), wherever its cursor is, with a paste. `pasteReady`: the GNOME extension
+ * remembered the window and can paste; `keysReady`: it can also focus the window and press shortcuts (v7).
+ */
+export function linuxEditTarget(
+  context: HelperContext,
+  selection: string,
+  pasteReady: boolean,
+  keysReady = false,
+): EditTarget | undefined {
+  // A Google Doc draws its text itself: Kiki pastes at its cursor, and changes it with its Find and replace.
+  if (context.ok && context.url && GOOGLE_DOC.test(context.url) && context.pid && (pasteReady || keysReady)) {
+    const keys = keysReady ? { keys: true } : {};
+    return { mode: selection ? "replace" : "insert", original: selection, kind: "docs", paste: pasteReady, ...keys, pid: context.pid };
+  }
+  const { edit } = context;
+  if (context.ok && edit) {
+    const viaPaste = SELECT_PASTE_TOOLKITS.has(edit.toolkit ?? "");
+    const selectPaste = viaPaste && keysReady && Boolean(edit.pid) && edit.kind !== "terminal";
+    const atspi =
+      (edit.editable && edit.pid && !viaPaste) || selectPaste
+        ? { pid: edit.pid!, path: edit.path, ...(edit.role ? { role: edit.role } : {}), start: edit.start, end: edit.end }
+        : undefined;
+    if (!atspi && !pasteReady) return undefined;
+    // What's highlighted in a terminal is its output: text goes in at the prompt.
+    const original = edit.kind === "terminal" ? "" : edit.expected;
+    return {
+      mode: original ? "replace" : "insert",
+      original,
+      kind: edit.kind,
+      ...(atspi ? { atspi } : {}),
+      ...(selectPaste ? { selectPaste: true } : {}),
+      // Changes in several places need the text, and a way to write in it.
+      ...(atspi && edit.full ? { full: edit.full } : {}),
+      paste: pasteReady,
+      ...(keysReady ? { keys: true } : {}),
+    };
+  }
+  // A window that shares its text, without an editable cursor, is something to read, not to write in.
+  const opaque = context.ok && (context.source === "none" || (!context.text && !context.vicinity));
+  if (!opaque || !pasteReady) return undefined;
+  return { mode: selection ? "replace" : "insert", original: selection, kind: "unknown", paste: true };
+}
+
+/**
+ * The form on the page (or in the window), when it has at least two text fields on screen: a list of
+ * results with check boxes isn't a form. Not in Google Docs, whose fields are its own toolbar.
+ */
+export function linuxForm(context: HelperContext, keysReady: boolean): FormTarget | undefined {
+  if (!context.ok || !context.fields || !context.pid || (context.url && GOOGLE_DOC.test(context.url))) return undefined;
+  // Only labelled fields: nobody could say what goes in the others.
+  const onScreen = context.fields.filter((field) => field.onScreen && field.label.trim());
+  if (onScreen.filter((field) => field.kind === "text" || field.kind === "textarea").length < 2) return undefined;
+  const selectPaste = SELECT_PASTE_TOOLKITS.has(context.toolkit ?? "");
+  // Text in a browser goes in with a paste, which needs the extension to focus the window first.
+  if (selectPaste && !keysReady) return undefined;
+  return {
+    pid: context.pid,
+    selectPaste,
+    fields: onScreen.map((field, index) => ({
+      id: `f${index + 1}`,
+      label: field.label,
+      kind: field.kind,
+      path: field.path,
+      ...(field.role ? { role: field.role } : {}),
+      ...(field.kind === "checkbox" || field.kind === "radio"
+        ? { checked: Boolean(field.checked) }
+        : { value: field.value ?? "", ...(field.length !== undefined ? { length: field.length } : {}) }),
+    })),
+  };
+}
+
 async function readContext(
   read: { seconds: number; timeoutMs: number },
   signal?: AbortSignal,
@@ -131,25 +258,26 @@ async function readContext(
   }
 }
 
-export async function captureLinux(policy: ScreenshotPolicy): Promise<Capture> {
+export async function captureLinux(policy: ScreenshotPolicy): Promise<RawCapture> {
   const notes: string[] = [];
 
   // Both go before wl-paste, which briefly grabs focus on GNOME and would change which window
   // looks "active". The GNOME extension remembers the window for screenshots after the popup opens.
   const fullRead = new AbortController();
   const full = readContext(FULL_READ, fullRead.signal);
-  const [context, sourceKnown] = await Promise.all([
-    readContext(QUICK_READ),
-    policy === "never" ? Promise.resolve(false) : rememberSource(),
-  ]);
-  // Terminals and editors send only the lines near the selection, which the quick read has.
+  const [context, sourceVersion] = await Promise.all([readContext(QUICK_READ), rememberSource()]);
+  const sourceKnown = policy !== "never" && sourceVersion !== null;
+  // Terminals and editors send only the lines near the selection, which the quick read has. The full
+  // read also stands in when the quick read fails: a big page read for the first time can be slow.
   const fullText =
-    context.ok && context.truncated && !context.vicinity
-      ? full.then((result) => (result.ok && !result.vicinity && result.text) || undefined)
+    !context.ok || (context.truncated && !context.vicinity)
+      ? full.then((result): PageText | undefined =>
+          result.ok && !result.vicinity && result.text ? { text: result.text, focus: result.focus } : undefined,
+        )
       : undefined;
   if (!fullText) fullRead.abort();
   if (!context.ok) {
-    notes.push("Kiki couldn't read the window's text (accessibility helper failed).");
+    notes.push("Kiki's quick read of the window's text failed; the full read stands in.");
     console.warn("[kiki] accessibility helper:", context.error);
   } else if (context.source === "none") {
     notes.push("This app doesn't share its text with Kiki. For browsers, turn on “Read text in browsers” in Settings.");
@@ -157,9 +285,8 @@ export async function captureLinux(policy: ScreenshotPolicy): Promise<Capture> {
 
   const text = context.text ?? "";
   const { vicinity } = context;
-  // A terminal's or editor's own text covers what a screenshot would show.
-  const wantScreenshot =
-    policy === "always" || (policy === "auto" && !vicinity && text.length < AUTO_SCREENSHOT_MIN_TEXT);
+  // Unless Settings says "always", a screenshot waits for the popup's camera button.
+  const wantScreenshot = policy === "always";
   const screenshotNow = async (): Promise<ScreenshotResult> => {
     const fromSource = sourceKnown ? await sourceScreenshot() : undefined;
     return fromSource?.screenshot ? fromSource : portalScreenshot();
@@ -176,15 +303,22 @@ export async function captureLinux(policy: ScreenshotPolicy): Promise<Capture> {
     console.warn("[kiki] screenshot:", shot.error);
   }
 
+  const selection = context.selection || (fresh ? primary : "");
+  const version = sourceVersion ?? 0;
+  const editTarget = linuxEditTarget(context, selection, version >= PASTE_VERSION, version >= KEYS_VERSION);
+  const form = linuxForm(context, version >= KEYS_VERSION);
   return {
-    selection: context.selection || (fresh ? primary : ""),
+    selection,
     appName: context.appName ?? undefined,
     windowTitle: context.windowTitle ?? undefined,
     text: text || undefined,
+    focus: context.focus,
     vicinity,
     fullText,
     screenshot: shot?.screenshot,
     takeScreenshot: sourceKnown ? async () => (await sourceScreenshot()).screenshot : undefined,
+    ...(editTarget ? { editTarget } : {}),
+    ...(form ? { form } : {}),
     notes,
   };
 }

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type Anthropic from "@anthropic-ai/sdk";
+import type { ToolResult } from "@kiki/shared";
 
 export interface Conversation {
   id: string;
@@ -9,6 +10,10 @@ export interface Conversation {
   userTurns: number;
   lastUsed: number;
   busy: boolean;
+  /** Read tools the app is running for the current turn, by tool_use id. */
+  pendingTools: Map<string, (result: ToolResult) => void>;
+  /** The personality prompt the conversation started with. */
+  personality?: string;
 }
 
 export interface ConversationStoreOptions {
@@ -42,6 +47,7 @@ export class ConversationStore {
       userTurns: 0,
       lastUsed: this.now(),
       busy: false,
+      pendingTools: new Map(),
     };
     this.#byId.set(conversation.id, conversation);
     return conversation;

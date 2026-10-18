@@ -1,4 +1,10 @@
-import type { ActionResult, ScreenshotPolicy, SettingsUpdate, SettingsView } from "../shared-types.ts";
+import type {
+  ActionResult,
+  PersonalityChoice,
+  ScreenshotPolicy,
+  SettingsUpdate,
+  SettingsView,
+} from "../shared-types.ts";
 import "@fontsource-variable/geist";
 import "@fontsource-variable/geist-mono";
 import "./styles.css";
@@ -13,6 +19,8 @@ const accessCode = $<HTMLInputElement>("accessCode");
 const hotkey = $<HTMLInputElement>("hotkey");
 const screenshot = $<HTMLSelectElement>("screenshot");
 const launchAtLogin = $<HTMLInputElement>("launchAtLogin");
+const personality = $<HTMLSelectElement>("personality");
+const customPersonality = $<HTMLTextAreaElement>("customPersonality");
 const saveStatus = $<HTMLSpanElement>("saveStatus");
 const testResult = $<HTMLSpanElement>("testResult");
 
@@ -35,6 +43,10 @@ function render(view: SettingsView): void {
   hotkey.value = view.hotkey;
   screenshot.value = view.screenshot;
   launchAtLogin.checked = view.launchAtLogin;
+  personality.value = view.personality;
+  // Keep an unsaved prompt when the window regains focus.
+  if (document.activeElement !== customPersonality) customPersonality.value = view.customPersonality;
+  showCustom();
   setText("storageWarning", view.storageWarning);
   setText("hotkeyError", view.hotkeyError);
 
@@ -81,6 +93,17 @@ function render(view: SettingsView): void {
     setText("linuxProblems", problems.join(" ") || undefined);
   }
 
+  const google = view.google;
+  googleConnected = google.connected;
+  $("accounts").hidden = !google.available;
+  $("google").textContent = google.connected ? "Disconnect" : "Connect Google";
+  if (!googleBusy) {
+    show($("googleStatus"), {
+      ok: google.connected,
+      message: google.connected ? `Connected${google.email ? ` as ${google.email}` : ""}` : "Not connected",
+    });
+  }
+
   const mac = view.mac;
   $("macPerms").hidden = !mac;
   if (mac) {
@@ -92,12 +115,22 @@ function render(view: SettingsView): void {
   }
 }
 
+/** The prompt box shows only for "My own way…". */
+function showCustom(): void {
+  $("customWrap").hidden = personality.value !== "custom";
+}
+
+let googleConnected = false;
+let googleBusy = false;
+
 function collect(): SettingsUpdate {
   const update: SettingsUpdate = {
     serverUrl: serverUrl.value,
     hotkey: hotkey.value,
     screenshot: screenshot.value as ScreenshotPolicy,
     launchAtLogin: launchAtLogin.checked,
+    personality: personality.value as PersonalityChoice,
+    customPersonality: customPersonality.value,
   };
   if (accessCode.value.trim()) update.accessCode = accessCode.value;
   return update;
@@ -113,6 +146,11 @@ async function save(): Promise<ActionResult> {
   if (result.ok) await refresh();
   return result;
 }
+
+personality.addEventListener("change", () => {
+  showCustom();
+  if (personality.value === "custom") customPersonality.focus();
+});
 
 form.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -162,6 +200,21 @@ $("enableA11y").addEventListener("click", async () => {
 $("macPermissions").addEventListener("click", async () => {
   const result = await api.requestMacPermissions();
   show($("macStatus"), result);
+});
+
+$("google").addEventListener("click", async () => {
+  if (googleBusy) return;
+  googleBusy = true;
+  const button = $<HTMLButtonElement>("google");
+  button.disabled = true;
+  const status = $("googleStatus");
+  status.textContent = googleConnected ? "Disconnecting…" : "Finish signing in in your browser…";
+  status.className = "hint";
+  const result = googleConnected ? await api.disconnectGoogle() : await api.connectGoogle();
+  googleBusy = false;
+  button.disabled = false;
+  await refresh();
+  show(status, result);
 });
 
 $("quit").addEventListener("click", () => api.quit());

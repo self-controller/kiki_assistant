@@ -1,5 +1,9 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import {
+  ACTION_OUTCOMES,
+  CHANGES_MODES,
+  EDIT_MODES,
+  FIELD_KINDS,
   EFFORT_LEVELS,
   LIMITS,
   MODEL_CHOICES,
@@ -9,7 +13,10 @@ import {
   type FollowUpRequest,
   type MeResponse,
   type QuestionOptions,
+  type AppToolName,
   type StartConversationRequest,
+  type ToolAccess,
+  type ToolResult,
   type TranscribeResponse,
 } from "@kiki/shared";
 import { Hono, type Context } from "hono";
@@ -19,7 +26,7 @@ import { z } from "zod";
 import { classifyError, MODEL_IDS, runTurn, type ClaudeConfig } from "./claude.ts";
 import type { CodeRecord, CodeStore } from "./codes.ts";
 import type { Conversation, ConversationStore } from "./conversations.ts";
-import { buildFirstUserMessage, buildFollowUpMessage } from "./prompt.ts";
+import { buildConversationStart, buildFollowUpMessage } from "./prompt.ts";
 import { audioExtension, SttError, transcribe, type SttConfig } from "./stt.ts";
 
 export interface AppDeps {
@@ -33,6 +40,8 @@ export interface AppDeps {
   sttFetch?: typeof fetch;
   maxConcurrentPerCode?: number;
   heartbeatMs?: number;
+  /** How long a turn waits for the app to run a read tool. */
+  toolTimeoutMs?: number;
   log?: (line: string) => void;
 }
 
@@ -59,6 +68,53 @@ const optionsSchema = z
   })
   .optional();
 
+const toolsSchema = z
+  .object({
+    actions: z.boolean().optional(),
+    calendarRead: z.boolean().optional(),
+    tasksRead: z.boolean().optional(),
+    edit: z.enum(EDIT_MODES).optional(),
+    changes: z.enum(CHANGES_MODES).optional(),
+    fill: z.boolean().optional(),
+    open: z.boolean().optional(),
+  })
+  .optional();
+
+const clockSchema = z
+  .object({
+    timeZone: z.string().min(1).max(100),
+    now: z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/, "must be ISO 8601"),
+  })
+  .optional();
+
+const outcomesSchema = z
+  .array(
+    z.object({
+      id: z.string().min(1).max(100),
+      kind: z.enum(["event", "task", "email", "edit", "changes", "fill"]),
+      outcome: z.enum(ACTION_OUTCOMES),
+      summary: z.string().max(1_000),
+    }),
+  )
+  .max(LIMITS.actionOutcomes)
+  .optional();
+
+/** What every question can carry besides its text and images. */
+const questionExtras = { tools: toolsSchema, clock: clockSchema, actionOutcomes: outcomesSchema };
+
+const toolResultsSchema = z.object({
+  results: z
+    .array(
+      z.object({
+        id: z.string().min(1).max(200),
+        content: z.string().max(LIMITS.toolResultChars),
+        isError: z.boolean().optional(),
+      }),
+    )
+    .min(1)
+    .max(10),
+});
+
 const startSchema = z.object({
   question: z.string().trim().min(1).max(LIMITS.questionChars),
   selection: z.string().max(LIMITS.selectionChars),
@@ -67,15 +123,42 @@ const startSchema = z.object({
     windowTitle: z.string().max(LIMITS.windowTitleChars).optional(),
     text: z.string().max(LIMITS.contextTextChars).optional(),
     screenshot: screenshotSchema.optional(),
+    editable: z
+      .object({ text: z.string().max(LIMITS.editableChars), truncated: z.boolean().optional() })
+      .optional(),
+    fields: z
+      .array(
+        z.object({
+          id: z.string().regex(/^f\d{1,3}$/),
+          label: z.string().max(LIMITS.fieldLabelChars),
+          kind: z.enum(FIELD_KINDS),
+          value: z.string().max(LIMITS.fieldValueChars).optional(),
+          checked: z.boolean().optional(),
+        }),
+      )
+      .max(LIMITS.formFields)
+      .optional(),
   }),
   images: imagesSchema,
   options: optionsSchema,
+  earlier: z
+    .array(
+      z.object({
+        question: z.string().trim().min(1).max(LIMITS.questionChars),
+        answer: z.string().trim().min(1).max(LIMITS.earlierAnswerChars),
+      }),
+    )
+    .max(LIMITS.earlierTurns)
+    .optional(),
+  personality: z.string().trim().max(LIMITS.personalityChars).optional(),
+  ...questionExtras,
 });
 
 const followUpSchema = z.object({
   question: z.string().trim().min(1).max(LIMITS.questionChars),
   images: imagesSchema,
   options: optionsSchema,
+  ...questionExtras,
 });
 
 function errorJson(
@@ -101,6 +184,7 @@ export function createApp(deps: AppDeps) {
   const stt = deps.stt ?? null;
   const maxConcurrent = deps.maxConcurrentPerCode ?? 2;
   const heartbeatMs = deps.heartbeatMs ?? 15_000;
+  const toolTimeoutMs = deps.toolTimeoutMs ?? 30_000;
   const log = deps.log ?? ((line: string) => console.log(line));
   const activeByCode = new Map<number, number>();
 
@@ -129,7 +213,7 @@ export function createApp(deps: AppDeps) {
       name: record.name,
       usedToday: codes.usedToday(record.id),
       dailyLimit: record.dailyLimit,
-      features: { voice: stt !== null },
+      features: { voice: stt !== null, actions: true },
     };
     return c.json(body);
   });
@@ -157,6 +241,7 @@ export function createApp(deps: AppDeps) {
     conversation: Conversation,
     isFirstTurn: boolean,
     options: QuestionOptions | undefined,
+    tools: ToolAccess | undefined,
   ) {
     // The model can change between turns: the API skips earlier thinking the new model can't read.
     const model = options?.model ? MODEL_IDS[options.model] : config.model;
@@ -176,6 +261,24 @@ export function createApp(deps: AppDeps) {
     return streamSSE(c, async (stream) => {
       const controller = new AbortController();
       stream.onAbort(() => controller.abort());
+
+      // Waits for the app to POST this read tool's result, or gives Claude an error after a while.
+      const callTool = (id: string, _name: AppToolName, _input: Record<string, unknown>) =>
+        new Promise<ToolResult>((resolve) => {
+          const finish = (result: ToolResult) => {
+            clearTimeout(timer);
+            controller.signal.removeEventListener("abort", onAbort);
+            conversation.pendingTools.delete(id);
+            resolve(result);
+          };
+          const onAbort = () => finish({ id, content: "Cancelled.", isError: true });
+          const timer = setTimeout(
+            () => finish({ id, content: "The Kiki app didn't answer in time.", isError: true }),
+            toolTimeoutMs,
+          );
+          controller.signal.addEventListener("abort", onAbort);
+          conversation.pendingTools.set(id, finish);
+        });
 
       let writes = Promise.resolve();
       const send = (event: KikiEvent) => {
@@ -197,6 +300,9 @@ export function createApp(deps: AppDeps) {
           signal: controller.signal,
           model,
           effort,
+          tools,
+          personality: conversation.personality,
+          callTool,
         });
         codes.recordUsage(record, result.usage);
         const u = result.usage;
@@ -206,7 +312,7 @@ export function createApp(deps: AppDeps) {
           log(`[kiki] ${record.name}: refused ${stats}`);
           send({ type: "error", code: "refused", message: "Kiki can't help with this one." });
         } else {
-          conversation.messages.push(...result.assistantMessages);
+          conversation.messages.push(...result.messages);
           log(`[kiki] ${record.name}: ${result.stopReason} ${stats}`);
           if (result.sources.length > 0) send({ type: "sources", items: result.sources });
           send({ type: "done", stopReason: result.stopReason });
@@ -238,9 +344,12 @@ export function createApp(deps: AppDeps) {
 
     const request: StartConversationRequest = parsed.data;
     const conversation = conversations.create(record.id);
+    if (request.personality) conversation.personality = request.personality;
     const today = new Date(conversations.now()).toISOString().slice(0, 10);
-    conversation.messages.push(buildFirstUserMessage(request, today));
-    return streamTurn(c, record, conversation, true, request.options);
+    conversation.messages.push(...buildConversationStart(request, today));
+    // Earlier turns it carries over count toward the conversation's length.
+    conversation.userTurns += request.earlier?.length ?? 0;
+    return streamTurn(c, record, conversation, true, request.options, request.tools);
   });
 
   app.post("/v1/conversations/:id/messages", limitBody, async (c) => {
@@ -264,7 +373,23 @@ export function createApp(deps: AppDeps) {
 
     const request: FollowUpRequest = parsed.data;
     conversation.messages.push(buildFollowUpMessage(request));
-    return streamTurn(c, record, conversation, false, request.options);
+    return streamTurn(c, record, conversation, false, request.options, request.tools);
+  });
+
+  // Results of read tools the app ran during a streaming turn. Allowed while busy; that's when they come.
+  app.post("/v1/conversations/:id/tool-results", limitBody, async (c) => {
+    const record = c.get("code");
+    const parsed = toolResultsSchema.safeParse(await readJson(c));
+    if (!parsed.success) {
+      return errorJson(c, 400, "invalid", `Invalid request: ${z.prettifyError(parsed.error)}`);
+    }
+    const conversation = conversations.get(c.req.param("id"), record.id);
+    const waiting = parsed.data.results.filter((result) => conversation?.pendingTools.has(result.id));
+    if (!conversation || waiting.length === 0) {
+      return errorJson(c, 404, "expired", "Kiki isn't waiting for these results anymore.");
+    }
+    for (const result of waiting) conversation.pendingTools.get(result.id)?.(result);
+    return c.json({ accepted: waiting.length });
   });
 
   const limitAudio = bodyLimit({

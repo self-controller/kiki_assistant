@@ -3,7 +3,7 @@ import { app, BrowserWindow, shell } from "electron";
 import { POPUP_WIDTH } from "../renderer/layout.ts";
 
 export const isWayland = process.platform === "linux" && Boolean(process.env.WAYLAND_DISPLAY);
-const isMac = process.platform === "darwin";
+export const isMac = process.platform === "darwin";
 
 export function preloadPath(): string {
   return join(import.meta.dirname, "../preload/index.cjs");
