@@ -15,6 +15,8 @@
   kiki_context.py --press JSON   Clicks a check box, button or link: {"pid", "path", "role", "checked"?, "name"?}
   kiki_context.py --check-presses JSON  Whether each of {"pid", "controls": [{"path", "role", "name"}]} is still
                                there to press
+  kiki_context.py --click JSON   Presses a link or button like --press, waits for the page it opens (or a
+                               change in place), then reads the screen: {"pid", "window", "path", "role", "name"}
   kiki_context.py --screen JSON  What's on screen now in the window an earlier read found: {"pid", "window"}
   kiki_context.py --scroll JSON  Scrolls a page there over AT-SPI, then reads the screen: {"pid", "window"} plus
                                {"direction": "down" | "up"} or {"to": text on the page}
@@ -109,6 +111,12 @@ WINDOW_ROLES = {Atspi.Role.FRAME, Atspi.Role.WINDOW, Atspi.Role.DIALOG}
 SCROLL_TO_Y = 200
 # Where a page scrolls the last line on screen when it moves down a screen, so it shows again at the top.
 NEXT_SCREEN_Y = 120
+# How long a click waits for a page it opened to load, and how long one that opens no page (a button that shows
+# more, a tab the page draws itself) waits for the address to change before Kiki reads the screen.
+CLICK_LOAD_SECONDS = 6
+CLICK_QUIET_SECONDS = 1.2
+# Time for the window to draw what a click changed before Kiki reads it.
+CLICK_SETTLE_SECONDS = 0.3
 
 
 class Budget:
@@ -127,6 +135,8 @@ class Budget:
         # A screen read (read_screen()): only what's on screen, and the controls there to press, in reading order.
         self.screen_only = False
         self.controls = None
+        # A screen read's view of the page, as window extents (x, y, width, height), when the toolkit says.
+        self.viewport = None
 
     def exhausted(self):
         return self.chars_left <= 0 or self.nodes_left <= 0 or time.monotonic() > self.deadline
@@ -197,8 +207,10 @@ def collect(obj, budget, depth=0, path=()):
     if role in SKIP_ROLES or not visible_states(states):
         return ""
     showing = states is None or states.contains(Atspi.StateType.SHOWING)
-    # Browsers clear "showing" on what's scrolled out of view, and so on everything inside it.
-    if budget.screen_only and not showing:
+    # Browsers clear "showing" on what's scrolled out of view, and so on everything inside it. Firefox also leaves
+    # it off some containers that are on screen while what's in them has it (GitHub's issue list), so one whose
+    # box is in view is read anyway.
+    if budget.screen_only and not showing and not in_view(obj, budget.viewport):
         return ""
     if (
         budget.focused_editable is None
@@ -253,6 +265,25 @@ def collect_text(obj, role, states, budget, depth, path):
             out.append(piece)
         return "".join(out)
     return text
+
+
+def window_box(obj):
+    """obj's extents in its window as (x, y, width, height), or None when the toolkit doesn't say."""
+    component = safe(obj.get_component_iface)
+    extents = safe(lambda: Atspi.Component.get_extents(component, Atspi.CoordType.WINDOW)) if component else None
+    if extents is None or extents.width <= 0 or extents.height <= 0:
+        return None
+    return (extents.x, extents.y, extents.width, extents.height)
+
+
+def in_view(obj, viewport):
+    """Whether obj's box overlaps the viewport. False when either is unknown."""
+    box = window_box(obj) if viewport is not None else None
+    if box is None:
+        return False
+    x, y, width, height = box
+    vx, vy, vwidth, vheight = viewport
+    return x < vx + vwidth and x + width > vx and y < vy + vheight and y + height > vy
 
 
 def control_label(obj):
@@ -1007,7 +1038,8 @@ def press_check(request):
     if request.get("name") and control_label(obj) != request["name"]:
         return None, None, "moved"
     action = safe(obj.get_action_iface)
-    if action is None or not (safe(lambda: Atspi.Action.get_n_actions(action), 0) or 0):
+    # Firefox can report no actions the first time it's asked about a control, while it fills them in.
+    if action is None or not wait_for(lambda: (safe(lambda: Atspi.Action.get_n_actions(action), 0) or 0) > 0, 0.5):
         return None, None, "no_action"
     return obj, action, None
 
@@ -1043,6 +1075,57 @@ def press(request):
     return {"ok": True, "changed": True}
 
 
+def page_url(window):
+    """The address of the page showing in window now, or None (no page, or not a browser)."""
+    document = find_document(window)
+    return document_url(document) if document is not None else None
+
+
+def page_loading(window):
+    """Whether the page showing in window is still loading: none yet, a blank new tab, or a busy document."""
+    document = find_document(window)
+    if document is None:
+        return True
+    return has_state(document, Atspi.StateType.BUSY) or (document_url(document) or "about:blank") == "about:blank"
+
+
+def click(request):
+    """Presses a link or button like press(), then waits for what it opens: a new page (the address showing
+    changes, also when it opened in a new tab) until it has loaded, or else a moment for the page to change in
+    place. Returns the screen as it settled (see settled_screen()), plus "navigated", or {"ok": false, "reason"}
+    as press() does.
+    """
+    app, window = find_source(int(request["pid"]), request.get("window"))
+    if window is None:
+        return {"ok": False, "reason": "gone"}
+    before_url = page_url(window)
+    before_text = read_screen(app, window)["text"]
+    pressed = press(request)
+    if not pressed["ok"]:
+        return pressed
+    navigated = wait_for(lambda: page_url(window) != before_url, CLICK_QUIET_SECONDS)
+    if navigated:
+        wait_for(lambda: not page_loading(window), CLICK_LOAD_SECONDS)
+    return {"ok": True, "navigated": navigated, **settled_screen(app, window, before_text, navigated)}
+
+
+def settled_screen(app, window, before_text, navigated):
+    """Reads the screen until it settles: two reads in a row agree and, after a click that opened a page, it no
+    longer shows what it showed before (a page that draws itself, like GitHub, changes its address first and
+    what's on screen a moment later). Returns the last read when it hasn't by CLICK_LOAD_SECONDS.
+    """
+    deadline = time.monotonic() + (CLICK_LOAD_SECONDS if navigated else CLICK_QUIET_SECONDS)
+    time.sleep(CLICK_SETTLE_SECONDS)
+    read = read_screen(app, window)
+    while time.monotonic() < deadline:
+        time.sleep(CLICK_SETTLE_SECONDS)
+        again = read_screen(app, window)
+        if again["text"] == read["text"] and not (navigated and again["text"] == before_text):
+            return again
+        read = again
+    return read
+
+
 def find_source(pid, window_path):
     """The app with `pid` and its window an earlier read found (its child index), or the one showing a page
     when that index no longer leads to a window. (None, None) when the app is gone.
@@ -1068,6 +1151,7 @@ def read_screen(app, window, max_chars=150_000, max_seconds=3):
     budget.controls = []
     document = find_document(window)
     root = document or window
+    budget.viewport = window_box(root)
     text = normalize(collect(root, budget))
     result = {"windowTitle": safe(window.get_name), "text": text, "truncated": budget.exhausted(), "controls": [], "fields": []}
     url = document_url(document) if document is not None else None
@@ -1347,6 +1431,7 @@ def main():
     parser.add_argument("--verify", metavar="JSON")
     parser.add_argument("--press", metavar="JSON")
     parser.add_argument("--check-presses", metavar="JSON")
+    parser.add_argument("--click", metavar="JSON")
     parser.add_argument("--screen", metavar="JSON")
     parser.add_argument("--scroll", metavar="JSON")
     parser.add_argument("--docs-dialog", metavar="JSON")
@@ -1375,6 +1460,8 @@ def main():
             output = press(json.loads(args.press))
         elif args.check_presses:
             output = check_presses(json.loads(args.check_presses))
+        elif args.click:
+            output = click(json.loads(args.click))
         elif args.screen:
             output = screen(json.loads(args.screen))
         elif args.scroll:

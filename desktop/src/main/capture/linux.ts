@@ -344,6 +344,8 @@ export async function captureLinux(policy: ScreenshotPolicy): Promise<RawCapture
     selection,
     appName: context.appName ?? undefined,
     windowTitle: context.windowTitle ?? undefined,
+    // Only a page's: the helper reads it from the page's document.
+    ...(context.source === "document" && context.url ? { url: context.url } : {}),
     text: text || undefined,
     focus: context.focus,
     vicinity,

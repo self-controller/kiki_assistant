@@ -906,6 +906,49 @@ describe("Kiki's own tools", () => {
     expect(t.requests[1]!.system).toEqual(t.requests[0]!.system);
   });
 
+  it("offers click only to apps that click right away, alongside scroll and look", async () => {
+    const t = setup([1, 2].map(() => ({ blocks: [{ type: "text" as const, text: "ok" }] })));
+    await readEvents(await t.post("/v1/conversations", { ...START, tools: { screen: true, click: true } }));
+    await readEvents(await t.post("/v1/conversations", { ...START, tools: { click: true } }));
+    expect(toolNames(t.requests[0]!)).toEqual(["web_search", "web_fetch", "scroll", "look", "click"]);
+    expect(toolNames(t.requests[1]!)).toEqual(["web_search", "web_fetch"]);
+  });
+
+  it("clicks around the page with the app, which says what it clicked, and shows Claude where it landed", async () => {
+    const click = (control: string) => ({
+      blocks: [{ type: "tool_use" as const, name: "click", input: { control } }],
+      stopReason: "tool_use",
+    });
+    // More clicks than tool rounds: getting around a page doesn't use them up.
+    const t = setup([
+      ...["b7", " b8 ", "b9", "b10", "b11"].map(click),
+      { blocks: [{ type: "text", text: "Here's the MIT license." }] },
+    ]);
+    const response = await t.post("/v1/conversations", {
+      ...START,
+      context: { ...START.context, url: "https://github.com/x/y" },
+      tools: { ...TOOLS, screen: true, press: true, click: true },
+    });
+    const landed = {
+      content: "Clicked “MIT license”. It opened another page.",
+      screen: { url: "https://github.com/x/y/blob/main/LICENSE", text: "MIT License ⟦b12 Raw⟧" },
+    };
+    const events = await answeringToolCalls(t, response, Array.from({ length: 5 }, () => landed));
+    expect(events.filter((e) => e.type === "tool_call").map((e) => (e as { input: unknown }).input)).toEqual(
+      ["b7", "b8", "b9", "b10", "b11"].map((control) => ({ control })),
+    );
+    // The app says what it clicked, from what it read on the control.
+    expect(events.some((e) => e.type === "activity")).toBe(false);
+    expect(events.at(-1)).toEqual({ type: "done", stopReason: "end_turn" });
+    expect(t.requests[5]!.tool_choice).toBeUndefined();
+
+    const first = t.requests[0]!.messages as Array<{ content: Array<{ text?: string }> }>;
+    expect(first[0]!.content.at(-1)!.text).toContain("<page_url>\nhttps://github.com/x/y\n</page_url>");
+    const second = t.requests[1]!.messages as Array<{ content: Array<Record<string, unknown>> }>;
+    const result = second.at(-1)!.content[0] as { content: Array<{ text?: string }> };
+    expect(result.content[0]!.text).toContain("<page_url>\nhttps://github.com/x/y/blob/main/LICENSE\n</page_url>");
+  });
+
   it("scrolls the window step by step, reading each screen's text, fields and screenshot", async () => {
     const t = setup([
       {
@@ -1001,7 +1044,7 @@ describe("Kiki's own tools", () => {
     expect(events.filter((e) => e.type === "action")).toMatchObject([{ action: { kind: "press", presses: [{ control: "b2" }] } }]);
   });
 
-  it("returns scrolls and presses Kiki can't do to Claude as errors, without asking the app", async () => {
+  it("returns scrolls, presses and clicks Kiki can't do to Claude as errors, without asking the app", async () => {
     const bad = [
       { name: "scroll", input: {} },
       { name: "scroll", input: { direction: "left" } },
@@ -1009,6 +1052,9 @@ describe("Kiki's own tools", () => {
       { name: "scroll", input: { direction: "sideways" } },
       { name: "propose_press", input: { presses: [{ control: "f1" }] } },
       { name: "propose_press", input: { presses: [] } },
+      { name: "click", input: {} },
+      { name: "click", input: { control: "f2" } },
+      { name: "click", input: { control: "b12345" } },
     ];
     const t = setup(
       bad.flatMap(({ name, input }) => [
@@ -1018,7 +1064,7 @@ describe("Kiki's own tools", () => {
     );
     for (let i = 0; i < bad.length; i++) {
       const events = await readEvents(
-        await t.post("/v1/conversations", { ...START, tools: { ...TOOLS, screen: true, press: true } }),
+        await t.post("/v1/conversations", { ...START, tools: { ...TOOLS, screen: true, press: true, click: true } }),
       );
       expect(events.some((e) => e.type === "tool_call" || e.type === "activity" || e.type === "action")).toBe(false);
       const sent = t.requests[i * 2 + 1]!.messages as Array<{ content: Array<Record<string, unknown>> }>;

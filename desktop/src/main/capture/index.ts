@@ -19,6 +19,7 @@ export async function captureContext(policy: ScreenshotPolicy): Promise<Capture>
     selection,
     appName: raw.appName?.slice(0, LIMITS.appNameChars) || undefined,
     windowTitle: raw.windowTitle?.slice(0, LIMITS.windowTitleChars) || undefined,
+    url: raw.url && raw.url.length <= LIMITS.urlChars ? raw.url : undefined,
     text: nearbyText(vicinity ? vicinityText(vicinity, selection) : raw.text, selection, focus),
     fullText: fullText?.then((full) => full && nearbyText(full.text, selection, full.focus)),
   };

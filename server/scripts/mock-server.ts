@@ -6,7 +6,8 @@
 // calendar, reminders or email get action cards; "am I free" checks the calendar through the app. "typos"
 // proposes changes to the text at the cursor (upper-casing a few words), and "fill" fills the form. "scroll"
 // scrolls down three screens, then back to what it saw on the second; "like" or "press" looks at the screen and
-// proposes pressing its first button.
+// proposes pressing its first button. "take me to", "go to" or "open the" looks at the screen and clicks the
+// control whose label shares a word with the question (or the first one).
 import Anthropic from "@anthropic-ai/sdk";
 import { serve } from "@hono/node-server";
 import { createApp } from "../src/app.ts";
@@ -71,7 +72,8 @@ function turnQuestion(body: { messages: Array<{ role: string; content: unknown }
 
 /**
  * Scrolls through the window: three screens down, then back to a line from the second screen, then the answer.
- * Presses: a look, then a card for the first button on screen. Null once the question needs neither.
+ * Presses: a look, then a card for the first button on screen. Going somewhere: a look, then a click on the
+ * control that best fits the question. Null once the question needs none of these.
  */
 function screenTurn(body: Parameters<typeof answerFor>[0], tools: string[]): FakeTurn | null {
   const question = turnQuestion(body);
@@ -80,10 +82,21 @@ function screenTurn(body: Parameters<typeof answerFor>[0], tools: string[]): Fak
   const use = (name: string, input: Record<string, unknown>): FakeTurn => ({
     stopReason: "tool_use",
     blocks: [
-      { type: "text", text: name === "scroll" ? "Let me scroll a bit further." : "Let me look at the screen." },
+      {
+        type: "text",
+        text: name === "scroll" ? "Let me scroll a bit further." : name === "click" ? "Let me click it." : "Let me look at the screen.",
+      },
       { type: "tool_use", name, input },
     ],
   });
+  if (/take me|go to|open the/i.test(question) && tools.includes("look") && tools.includes("click")) {
+    if (calls.length === 0) return use("look", {});
+    if (calls.length > 1) return null;
+    const controls = [...seen.matchAll(/⟦(b\d+) ([^⟧]*)⟧/g)].map(([, id, label]) => ({ id: id!, label: label!.toLowerCase() }));
+    const words = question.toLowerCase().match(/\p{L}{3,}/gu) ?? [];
+    const control = controls.find((c) => words.some((word) => c.label.includes(word))) ?? controls[0];
+    return control ? use("click", { control: control.id }) : null;
+  }
   if (/like|press/i.test(question) && tools.includes("look") && tools.includes("propose_press")) {
     if (calls.length === 0) return use("look", {});
     const button = /⟦(b\d+)/.exec(seen)?.[1];

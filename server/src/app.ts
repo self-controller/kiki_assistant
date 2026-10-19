@@ -79,6 +79,7 @@ const toolsSchema = z
     open: z.boolean().optional(),
     screen: z.boolean().optional(),
     press: z.boolean().optional(),
+    click: z.boolean().optional(),
   })
   .optional();
 
@@ -127,6 +128,7 @@ const toolResultsSchema = z.object({
         screen: z
           .object({
             windowTitle: z.string().max(LIMITS.windowTitleChars).optional(),
+            url: z.string().max(LIMITS.urlChars).optional(),
             text: z.string().max(LIMITS.screenTextChars).optional(),
             fields: fieldsSchema,
             screenshot: screenshotSchema.optional(),
@@ -145,6 +147,7 @@ const startSchema = z.object({
   context: z.object({
     appName: z.string().max(LIMITS.appNameChars).optional(),
     windowTitle: z.string().max(LIMITS.windowTitleChars).optional(),
+    url: z.string().max(LIMITS.urlChars).optional(),
     text: z.string().max(LIMITS.contextTextChars).optional(),
     screenshot: screenshotSchema.optional(),
     editable: z

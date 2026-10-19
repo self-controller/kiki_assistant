@@ -29,10 +29,12 @@ and reading.
   this on YouTube", "search Substack for this") and it opens the search in a new browser tab right away. It
   can open Google, Google Images, YouTube, Google Maps and Google News searches, or a Google search of one
   site. Kiki builds the link itself, so it can only ever open a search, never another page.
-- **Scrolling.** Ask about what's further along ("scroll LinkedIn and find a post you'd find funny", "what's
-  below?", "go through this thread") and Kiki scrolls the window you were in, one screen at a time, reading
-  each screen as it goes. Then it scrolls back to what it picked, so it's on screen as it answers. It can
-  also press buttons and links there after you approve them. See [Scrolling and pressing](#scrolling-and-pressing).
+- **Scrolling and clicking around.** Ask about what's further along ("scroll LinkedIn and find a post you'd
+  find funny", "what's below?", "go through this thread") and Kiki scrolls the window you were in, one screen
+  at a time, reading each screen as it goes. Then it scrolls back to what it picked, so it's on screen as it
+  answers. Ask to go somewhere the page links to ("take me to the license", "open the Issues tab") and Kiki
+  clicks the link on the page you're on, then reads where it lands and carries on from there. Buttons that
+  change something wait for your approval. See [Scrolling and clicking](#scrolling-and-clicking).
 - **Pick the model and how hard it thinks.** The composer has a model picker (Haiku, Sonnet, Opus), an
   effort button that cycles Low, Medium, High and XHigh, and a **Search** toggle. Kiki remembers your picks.
 - **Screenshot button.** The camera next to **Search** shows Kiki a screenshot of the window you were in,
@@ -134,17 +136,22 @@ card.
 card with a value for each field. The card shows the label, the new value (which you can edit) and the old
 one. Kiki never sees password fields.
 
-### Scrolling and pressing
+### Scrolling and clicking
 
-Kiki can scroll the window you asked from and read what's on screen as it goes. Each step shows up in what
-it's thinking, and one answer scrolls at most 15 times.
+Kiki can scroll the window you asked from, click around it, and read what's on screen as it goes. Each step
+shows up in what it's thinking, and one answer scrolls and clicks at most 15 times.
 
 - **What it reads.** The text on screen. With the camera on, it also sees a screenshot of each screen. Apps
   that don't share their text (VS Code, Google Docs) can only be seen with the camera on. Removing the
   nearby-text chip keeps the window's text out of scrolling too.
-- **Pressing.** "Like it" or "open the second post" shows a card listing each button or link, with the text
-  just before it. Nothing is pressed until you press **Press**. Kiki checks first that each one is still
-  where it was, so a feed that shifted can't make it press the wrong post's button.
+- **The page you're on comes first.** In a browser, Kiki knows the page's address. Asked to go to something
+  the page links to, it finds that link on the page instead of searching the web for it.
+- **Clicking.** Links, tabs, menu items and buttons that only show more ("Show more", "Next page") are
+  clicked right away. Kiki waits for the page to load, reads it, and can keep clicking from there.
+- **Pressing.** Buttons that change something (like, send, post, follow, delete, buy, sign out...) come as a
+  card listing each one, with the text just before it, and nothing is pressed until you press **Press**.
+  Kiki checks first that each one is still where it was, so a feed that shifted can't make it press the
+  wrong post's button.
 - **Forms further down.** Fields that scroll into view join the form, so "fill this in" works after scrolling
   to them.
 
@@ -153,15 +160,15 @@ it's thinking, and one answer scrolls at most 15 times.
 When you ask a question, Kiki sends the highlighted text, and the popup has already shown the rest of what
 will be shared:
 
-- the app name and window title
+- the app name and window title (and the page's address, in a browser)
 - the nearby text (character count)
 - the screenshot (thumbnail)
 - any images you pasted or attached (thumbnails)
 
 Click ✕ on any chip to leave it out. Your personality prompt from Settings, if you chose one, goes with each
 new conversation. Cards and what you did with them (added, sent, replaced, dismissed) are sent with your next
-question. When Kiki scrolls, it sends the text on screen after each step (and a screenshot when the camera is
-on).
+question. When Kiki scrolls or clicks, it sends the text on screen after each step (and a screenshot when the
+camera is on).
 
 All of this goes to the Kiki server and then to Claude, Anthropic's AI model, to answer you. The server
 keeps a conversation in memory for an hour so follow-ups work, and counts how many questions each invite code

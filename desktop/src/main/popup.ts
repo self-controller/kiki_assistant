@@ -56,6 +56,7 @@ import { expectPopup, movePopup, placePopup, setHitRect } from "./linuxSetup.ts"
 import { personalityPrompt } from "./personalities.ts";
 import {
   applyPresses,
+  clickControl,
   describePresses,
   newScreenState,
   pressProblems,
@@ -293,6 +294,7 @@ function startRequest(
     context: {
       appName: omit.window ? undefined : capture.appName,
       windowTitle: omit.window ? undefined : capture.windowTitle,
+      url: omit.window ? undefined : capture.url,
       text: omit.text ? undefined : capture.text,
       screenshot,
       // The whole text at the cursor and the form's fields, for changes and fills; they're screen text too.
@@ -468,7 +470,7 @@ function writeTools(capture: Capture, omitText: boolean | undefined): Partial<To
 
 /**
  * Runs a tool Claude called for the app: a read, a check of changes, a fill or presses against the window now,
- * a search to open in the browser, or a scroll or look in the window.
+ * a search to open in the browser, or a scroll, look or click in the window.
  */
 async function runAppTool(
   session: PopupSession,
@@ -481,6 +483,15 @@ async function runAppTool(
     const result = await runScreenTool(session.capture, session.screen, call, session.look, session.abort?.signal);
     // Fields that scrolled into view can be filled: fill cards need their labels.
     if (result.screen?.fields && session.capture.form) send({ type: "fields", fields: formFields(session.capture.form) });
+    return result;
+  }
+  if (call.name === "click") {
+    const { capture } = session;
+    const { result, done } = await clickControl(capture, session.screen, call, session.look, (control) =>
+      send({ type: "activity", activity: { kind: "click", label: control.name } }),
+    );
+    // Fill cards go by the fields on the page it's on now.
+    if (done && capture.form) send({ type: "fields", fields: formFields(capture.form) });
     return result;
   }
   if (call.name === "propose_press") {

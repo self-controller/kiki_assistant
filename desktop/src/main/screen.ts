@@ -1,8 +1,17 @@
-// Kiki's scroll and look tools: they scroll the window the question came from and read what's on screen
-// then, for Claude to go through a feed or a long page. Buttons and links read there can be pressed with a
-// press card. Kiki's GNOME extension scrolls any app with a virtual touchpad (v8); before that, web pages
-// scroll over AT-SPI. The text comes from AT-SPI, and a screenshot of the window when the camera is on.
-import { LIMITS, type FormField, type PressTarget, type ScreenRead, type ScrollRequest, type ToolResult } from "@kiki/shared";
+// Kiki's scroll, look and click tools: they scroll the window the question came from and read what's on screen
+// then, for Claude to go through a feed or a long page, and click links there to get around it. Buttons that
+// change something are pressed with a press card instead. Kiki's GNOME extension scrolls any app with a virtual
+// touchpad (v8); before that, web pages scroll over AT-SPI. The text comes from AT-SPI, and a screenshot of the
+// window when the camera is on.
+import {
+  LIMITS,
+  type FormField,
+  type PressTarget,
+  type ScreenRead,
+  type Screenshot,
+  type ScrollRequest,
+  type ToolResult,
+} from "@kiki/shared";
 import type { ActionStatus } from "../shared-types.ts";
 import type { Capture, FieldTarget, FormTarget, SourceWindow } from "./capture/common.ts";
 import { runHelper, SELECT_PASTE_TOOLKITS, type HelperField } from "./capture/linux.ts";
@@ -24,6 +33,8 @@ const SCROLL_TO_Y = 200;
 const SETTLE_MS = 400;
 /** A scroll that moved nothing may have reached the end of a feed that loads more: it waits, then tries again. */
 const LOAD_MORE_MS = 1_000;
+/** The helper's click waits up to about 8 s for a page to load, then reads it. */
+const CLICK_TIMEOUT_MS = 14_000;
 /** How much of the text before a control a press card shows. */
 const NEAR_CHARS = 100;
 
@@ -68,19 +79,26 @@ interface HelperScreen {
   reason?: string;
   error?: string;
   windowTitle?: string | null;
+  /** The page's address, in a browser. */
+  url?: string;
   text?: string;
   controls?: HelperControl[];
   fields?: HelperField[];
   moved?: boolean;
   /** --scroll "not_moved": where the text is in the window, for the wheel to scroll it there. */
   y?: number;
+  /** --click: the click opened a page (the address changed). */
+  navigated?: boolean;
 }
 
 /**
  * Which screen tools the app can offer for a question: scroll and look when Kiki can reach the window and may
- * send something about it, presses and fills (fields can scroll into view) where AT-SPI reads its text.
+ * send something about it, clicks, presses and fills (fields can scroll into view) where AT-SPI reads its text.
  */
-export function screenTools(capture: Capture, access: ScreenAccess): { screen?: true; press?: true; fill?: true } {
+export function screenTools(
+  capture: Capture,
+  access: ScreenAccess,
+): { screen?: true; press?: true; click?: true; fill?: true } {
   const source = capture.source;
   if (!source) return {};
   const readable = Boolean(source.pid) && access.text;
@@ -88,7 +106,28 @@ export function screenTools(capture: Capture, access: ScreenAccess): { screen?: 
   if (!seen) return {};
   if (!readable) return { screen: true };
   const fillable = !SELECT_PASTE_TOOLKITS.has(source.toolkit ?? "") || source.keys;
-  return { screen: true, press: true, ...(fillable ? { fill: true } : {}) };
+  return { screen: true, press: true, click: true, ...(fillable ? { fill: true } : {}) };
+}
+
+/** Controls a click may press right away (AT-SPI role names): links, tabs, menu items and plain buttons. */
+const CLICK_ROLES = new Set(["link", "page tab", "menu item", "push button", "button"]);
+
+/**
+ * What a control that changes something says. Claude is told to put those on a press card; this keeps a click
+ * from pressing one anyway, e.g. because a page asked it to.
+ */
+const CHANGES_SOMETHING =
+  /\b(send|submit|post|publish|reply|comment|delete|remove|discard|archive|buy|order|pay|checkout|check out|purchase|subscribe|unsubscribe|follow|unfollow|like|unlike|react|share|repost|retweet|star|unstar|fork|save|block|report|mute|sign (in|out|up)|log ?(in|out)|confirm|accept|decline|approve|merge|install|download|upload|vote|upvote|downvote)\b/i;
+
+/**
+ * Why a click can't press this control right away, for Claude: a toggle (a like, a follow) or one that says it
+ * changes something goes on a press card, so the person approves it. Null when a click can press it.
+ */
+export function clickRefusal(control: ControlTarget): string | null {
+  const changes = !CLICK_ROLES.has(control.role ?? "") || CHANGES_SOMETHING.test(control.name);
+  return changes
+    ? `${control.id} (${control.name}) may change something, so the person has to approve it: put it on a propose_press card instead.`
+    : null;
 }
 
 /** The key a control keeps its id by: where it is and what it says. */
@@ -150,7 +189,7 @@ export function mergeFields(capture: Capture, source: SourceWindow, found: Helpe
   if (form.pid !== source.pid) return [];
   capture.form = form;
   const byKey = new Map(form.fields.map((field) => [fieldKey(field), field]));
-  let next = Math.max(0, ...form.fields.map((field) => Number(field.id.slice(1)) || 0)) + 1;
+  let next = lastFieldId(form) + 1;
   const seen: FieldTarget[] = [];
   for (const field of onScreen) {
     const toggle = field.kind === "checkbox" || field.kind === "radio";
@@ -176,6 +215,18 @@ export function mergeFields(capture: Capture, source: SourceWindow, found: Helpe
     seen.push(target);
   }
   return seen.slice(0, LIMITS.formFields).map(({ path: _path, role: _role, length: _length, ...field }) => field);
+}
+
+function lastFieldId(form: FormTarget): number {
+  return Math.max(form.lastId ?? 0, ...form.fields.map((field) => Number(field.id.slice(1)) || 0));
+}
+
+/**
+ * Leaves the form behind when a click opened another page: its fields' paths could lead to other things there.
+ * Fields on screen on the new page join it with new ids.
+ */
+function leaveForm(capture: Capture): void {
+  if (capture.form) capture.form = { ...capture.form, fields: [], lastId: lastFieldId(capture.form) };
 }
 
 const OUTCOME_ERRORS: Record<Exclude<ScrollOutcome, "scrolled">, string> = {
@@ -296,11 +347,28 @@ export async function runScreenTool(
   const now = signature(read, screenshot?.data);
   const atEnd = Boolean(request && "direction" in request && now !== undefined && now === state.last);
   state.last = now;
-  let note = request ? scrollNote(request, atEnd) : "This is what's on screen now.";
+  const note = request ? scrollNote(request, atEnd) : "This is what's on screen now.";
+  return { id: call.id, ...screenResult(capture, source, state, read, screenshot, access, note, atEnd) };
+}
 
+/**
+ * What Claude reads after a scroll, look or click: `note` (with a word on what it can't see), and the window's
+ * title, page address, text (with ids on its controls) and form fields, with a screenshot when the camera is on.
+ */
+function screenResult(
+  capture: Capture,
+  source: SourceWindow,
+  state: ScreenState,
+  read: HelperScreen | undefined,
+  screenshot: Screenshot | undefined,
+  access: ScreenAccess,
+  note: string,
+  atEnd = false,
+): { content: string; screen: ScreenRead } {
   const screen: ScreenRead = {};
   if (read) {
     if (access.window && read.windowTitle) screen.windowTitle = read.windowTitle.slice(0, LIMITS.windowTitleChars);
+    if (access.window && read.url && read.url.length <= LIMITS.urlChars) screen.url = read.url;
     const text = screenText(read.text ?? "", read.controls ?? [], state);
     if (text.trim()) screen.text = text.length > LIMITS.screenTextChars ? `${text.slice(0, LIMITS.screenTextChars - 1)}…` : text;
     const fields = mergeFields(capture, source, read.fields);
@@ -317,7 +385,54 @@ export async function runScreenTool(
   } else if (!screen.text && screen.screenshot) {
     note += " Only the screenshot shows it.";
   }
-  return { id: call.id, content: note, screen };
+  return { content: note, screen };
+}
+
+/** What a click did, for the popup: the control it pressed, and whether that opened another page. */
+export interface ClickDone {
+  control: ControlTarget;
+  navigated: boolean;
+}
+
+/**
+ * Runs a click in the window the question came from: presses a link, tab or harmless button Kiki read there,
+ * waits for the page it opens (or the change in place), and returns what's on screen then, like a look.
+ * `onClick` hears which control it's about to press, for the feed; `done` says what happened, once it did.
+ */
+export async function clickControl(
+  capture: Capture,
+  state: ScreenState,
+  call: { id: string; input: Record<string, unknown> },
+  access: ScreenAccess,
+  onClick?: (control: ControlTarget) => void,
+): Promise<{ result: ToolResult; done?: ClickDone }> {
+  const fail = (content: string) => ({ result: { id: call.id, content, isError: true } });
+  const source = capture.source;
+  if (!source?.pid) return fail("Kiki can't click anything in this window.");
+  const id = typeof call.input["control"] === "string" ? call.input["control"].trim() : "";
+  const control = state.controls.get(id);
+  if (!control) return fail(`${id || "That"} isn't one of the controls in <visible_text>: look or scroll first, and use the ids there.`);
+  const refusal = clickRefusal(control);
+  if (refusal) return fail(refusal);
+  onClick?.(control);
+  const read = await runHelper<HelperScreen>(
+    ["--click", JSON.stringify({ pid: source.pid, window: source.window, path: control.path, role: control.role, name: control.name })],
+    CLICK_TIMEOUT_MS,
+  ).catch((error: unknown): HelperScreen => ({ ok: false, error: String(error) }));
+  if (!read.ok) {
+    if (read.error) console.warn("[kiki] click:", read.error);
+    return fail(`Kiki couldn't click ${control.id} (${control.name}): it ${PRESS_REASONS[read.reason ?? ""] ?? "didn't work"}.`);
+  }
+  const navigated = Boolean(read.navigated);
+  if (navigated) leaveForm(capture);
+  const screenshot = access.screenshot && source.screenshot ? await source.screenshot().catch(() => undefined) : undefined;
+  const seen = access.text ? read : undefined;
+  state.last = signature(seen, screenshot?.data);
+  const note = `Clicked “${control.name}”.${navigated ? " It opened another page." : ""} This is what's on screen now.`;
+  return {
+    result: { id: call.id, ...screenResult(capture, source, state, seen, screenshot, access, note) },
+    done: { control, navigated },
+  };
 }
 
 /** What a scroll did, as the first line of its result. */

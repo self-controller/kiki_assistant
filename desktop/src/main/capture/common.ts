@@ -76,6 +76,8 @@ export interface FormTarget {
   fields: FieldTarget[];
   /** Text fields take a select-all and a paste, not AT-SPI writes; see EditTarget.selectPaste. */
   selectPaste: boolean;
+  /** The last id given to a field on a page a click left, so fields on the new one don't reuse it. */
+  lastId?: number;
 }
 
 /** The window the hotkey was pressed in, for scrolling it and reading it again once the popup is open. */
@@ -99,6 +101,8 @@ export interface Capture {
   selection: string;
   appName?: string;
   windowTitle?: string;
+  /** The address of the browser page the hotkey was pressed on. */
+  url?: string;
   /** Text around the selection (or what's on screen), trimmed to CONTEXT_CHARS. */
   text?: string;
   /**

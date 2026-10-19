@@ -46,6 +46,8 @@ export const LIMITS = {
   /** Buttons and links on one press card, and how much of each one's name and the text before it the card shows. */
   pressesPerCard: 10,
   controlLabelChars: 120,
+  /** A browser page's address, sent with the context and with what a scroll, look or click saw. */
+  urlChars: 2_000,
 } as const;
 
 export type ScreenshotMediaType = "image/jpeg" | "image/png";
@@ -62,6 +64,8 @@ export interface Screenshot {
 export interface CaptureContext {
   appName?: string;
   windowTitle?: string;
+  /** The address of the browser page the question came from. */
+  url?: string;
   /** Text near the selection (page or window text), already trimmed client-side. */
   text?: string;
   screenshot?: Screenshot;
@@ -139,6 +143,11 @@ export interface ToolAccess {
   screen?: boolean;
   /** The app can press the buttons and links it read on screen (`propose_press`). */
   press?: boolean;
+  /**
+   * The app clicks links, tabs and harmless buttons it read on screen right away (`click`), and shows the
+   * window afterwards. Buttons that change something still go on a press card.
+   */
+  click?: boolean;
 }
 
 /** Where `open_search` searches. The app builds each URL itself, so it only ever opens one of these. */
@@ -171,9 +180,11 @@ export type ScrollDirection = (typeof SCROLL_DIRECTIONS)[number];
  */
 export type ScrollRequest = { direction: ScrollDirection } | { to: string };
 
-/** What a `scroll` or `look` saw in the window afterwards. */
+/** What a `scroll`, `look` or `click` saw in the window afterwards. */
 export interface ScreenRead {
   windowTitle?: string;
+  /** The page's address, in a browser. */
+  url?: string;
   /** The text on screen now, with "⟦b3 Like⟧" where a button or link Kiki can press is. */
   text?: string;
   /** Form fields on screen now, by id; ids carry over from earlier reads. */
@@ -307,7 +318,7 @@ export interface ToolResult {
   /** Plain text (or JSON) for Claude to read. */
   content: string;
   isError?: boolean;
-  /** For `scroll` and `look`: what's on screen now. */
+  /** For `scroll`, `look` and `click`: what's on screen now. */
   screen?: ScreenRead;
 }
 
@@ -326,8 +337,8 @@ export type CheckToolName = (typeof CHECK_TOOLS)[number];
 export const OPEN_TOOLS = ["open_search"] as const;
 export type OpenToolName = (typeof OPEN_TOOLS)[number];
 
-/** Tools that move or read the window the question came from, without a card. */
-export const SCREEN_TOOLS = ["scroll", "look"] as const;
+/** Tools that move, read or click around the window the question came from, without a card. */
+export const SCREEN_TOOLS = ["scroll", "look", "click"] as const;
 export type ScreenToolName = (typeof SCREEN_TOOLS)[number];
 
 /** The tools the app runs during a turn (`tool_call` events). */
@@ -381,7 +392,9 @@ export type Activity =
   /** Kiki is opening a search in the person's browser; `label` is where, e.g. "Google Images". */
   | { kind: "open"; label: string; query: string }
   /** Kiki is scrolling the person's window or looking at it, e.g. "Scrolling down". */
-  | { kind: "scroll"; label: string };
+  | { kind: "scroll"; label: string }
+  /** Kiki is clicking a link or button in the person's window; `label` is what the control says. */
+  | { kind: "click"; label: string };
 
 export type KikiEvent =
   | { type: "conversation"; id: string }

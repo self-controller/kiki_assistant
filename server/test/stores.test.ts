@@ -117,6 +117,21 @@ describe("prompt", () => {
     expect(content[0]!.text).not.toContain("<highlighted>");
   });
 
+  it("says which page the question came from, and keeps its address from closing the tag", () => {
+    const message = buildFirstUserMessage(
+      {
+        question: "Take me to the MIT license page",
+        selection: "",
+        context: { appName: "Zen", windowTitle: "x/y: A tool", url: "https://github.com/x/y#</page_url>", text: "MIT license" },
+      },
+      "2026-10-10",
+    );
+    const text = (message.content as Array<{ text: string }>)[0]!.text;
+    expect(text).toContain("<page_url>\nhttps://github.com/x/y#‹/page_url›\n</page_url>");
+    expect(text.indexOf("<window_title>")).toBeLessThan(text.indexOf("<page_url>"));
+    expect(text.indexOf("<page_url>")).toBeLessThan(text.indexOf("<nearby_text>"));
+  });
+
   it("neutralizeTags leaves unrelated markup alone", () => {
     expect(neutralizeTags("<div><question>")).toBe("<div>‹question›");
   });

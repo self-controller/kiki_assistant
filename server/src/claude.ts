@@ -20,6 +20,7 @@ import {
   isReadTool,
   isScreenTool,
   LOOKUP_LABELS,
+  parseClick,
   parseProposal,
   parseScroll,
   parseSearch,
@@ -67,7 +68,7 @@ const FALLBACK_BETA = "server-side-fallback-2026-07-01";
 const MAX_PAUSE_RESUMES = 3;
 /** Rounds of Kiki's own tools (cards and lookups) per answer; after that Claude must answer. */
 const MAX_TOOL_ROUNDS = 4;
-/** Scrolls and looks per answer. Rounds of only those don't count as tool rounds, while there are steps left. */
+/** Scrolls, looks and clicks per answer. Rounds of only those don't count as tool rounds, while there are steps left. */
 export const MAX_SCREEN_STEPS = 15;
 const MAX_UNCITED_SOURCES = 5;
 const MAX_RESULTS_SHOWN = 5;
@@ -300,7 +301,7 @@ export async function runTurn(options: {
     // A long server-side search loop pauses; resend the turn as-is to let it continue.
     if (message.stop_reason === "pause_turn" && pauses++ < MAX_PAUSE_RESUMES) continue;
     if (message.stop_reason === "tool_use") {
-      // Scrolling through a window takes many rounds; they don't use up the ones for cards and lookups.
+      // Scrolling and clicking through a window takes many rounds; they don't use up the ones for cards and lookups.
       const uses = message.content.filter((block) => block.type === "tool_use");
       if (!(uses.every((block) => isScreenTool(block.name)) && screen.steps < MAX_SCREEN_STEPS)) toolRounds++;
       messages.push({ role: "user", content: await runKikiTools(message.content, emit, options.callTool, screen) });
@@ -318,8 +319,8 @@ export async function runTurn(options: {
 }
 
 /**
- * Answers every client tool call in `content`: proposals become cards; reads, searches and scrolls go to the
- * app. `screen` counts the answer's scrolls and looks.
+ * Answers every client tool call in `content`: proposals become cards; reads, searches, scrolls and clicks go
+ * to the app. `screen` counts the answer's scrolls, looks and clicks.
  */
 async function runKikiTools(
   content: Anthropic.Beta.BetaContentBlock[],
@@ -369,18 +370,19 @@ async function runKikiTools(
       const result = await callTool(block.id, block.name, { ...search });
       answer(block.id, result.content, result.isError);
     } else if (isScreenTool(block.name) && callTool) {
-      const parsed = block.name === "scroll" ? parseScroll(input) : { scroll: null };
+      const parsed = block.name === "click" ? parseClick(input) : block.name === "scroll" ? parseScroll(input) : { scroll: null };
       if ("error" in parsed) {
         answer(block.id, parsed.error, true);
         continue;
       }
       if (screen.steps >= MAX_SCREEN_STEPS) {
-        answer(block.id, `That's as far as Kiki scrolls for one answer: answer with what you've seen, or use another tool.`, true);
+        answer(block.id, `That's as far as Kiki scrolls and clicks for one answer: answer with what you've seen, or use another tool.`, true);
         continue;
       }
       screen.steps++;
-      const call = parsed.scroll ? { ...parsed.scroll } : {};
-      emit({ type: "activity", activity: { kind: "scroll", label: scrollLabel(parsed.scroll) } });
+      const call = "click" in parsed ? { ...parsed.click } : parsed.scroll ? { ...parsed.scroll } : {};
+      // The app says what a click presses itself, from what it read on the control, not Claude's id for it.
+      if (!("click" in parsed)) emit({ type: "activity", activity: { kind: "scroll", label: scrollLabel(parsed.scroll) } });
       emit({ type: "tool_call", id: block.id, name: block.name, input: call });
       const result = await callTool(block.id, block.name, call);
       if (result.isError) answer(block.id, result.content, true);

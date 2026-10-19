@@ -4,7 +4,17 @@ import { describe, expect, it } from "vitest";
 import type { Capture, SourceWindow } from "../src/main/capture/common.ts";
 import type { HelperField } from "../src/main/capture/linux.ts";
 import { applyEdits, describeAction } from "../src/main/google/format.ts";
-import { describePresses, mergeFields, newScreenState, pressProblems, screenText, screenTools } from "../src/main/screen.ts";
+import {
+  clickControl,
+  clickRefusal,
+  describePresses,
+  mergeFields,
+  newScreenState,
+  pressProblems,
+  screenText,
+  screenTools,
+  type ControlTarget,
+} from "../src/main/screen.ts";
 
 const ZEN: SourceWindow = { pid: 4242, window: [0], toolkit: "gecko", page: true, wheel: true, keys: true };
 const ALL = { text: true, window: true, screenshot: true };
@@ -17,10 +27,10 @@ function capture(source?: SourceWindow): Capture {
 const marker = (index: number, label: string) => `${index}${label}`;
 
 describe("screenTools", () => {
-  it("offers scrolling, presses and fills where Kiki reads the window's text", () => {
-    expect(screenTools(capture(ZEN), ALL)).toEqual({ screen: true, press: true, fill: true });
+  it("offers scrolling, clicks, presses and fills where Kiki reads the window's text", () => {
+    expect(screenTools(capture(ZEN), ALL)).toEqual({ screen: true, press: true, click: true, fill: true });
     // A browser fills text fields with a paste, which needs the extension to focus the window first.
-    expect(screenTools(capture({ ...ZEN, keys: false }), ALL)).toEqual({ screen: true, press: true });
+    expect(screenTools(capture({ ...ZEN, keys: false }), ALL)).toEqual({ screen: true, press: true, click: true });
   });
 
   it("scrolls a window without text only when the camera shows it", () => {
@@ -81,6 +91,12 @@ describe("mergeFields", () => {
     expect(mergeFields(into, ZEN, [field("City", [0, 7])]).map((f) => f.id)).toEqual(["f2"]);
   });
 
+  it("numbers fields on a page a click opened after the ones on the page it left", () => {
+    const into = capture(ZEN);
+    into.form = { pid: 4242, selectPaste: true, fields: [], lastId: 3 };
+    expect(mergeFields(into, ZEN, [field("Search", [0, 2])]).map((f) => f.id)).toEqual(["f4"]);
+  });
+
   it("leaves browser text fields alone without the extension's focus", () => {
     const into = capture(ZEN);
     expect(mergeFields(into, { ...ZEN, keys: false }, [field("Name", [0, 1])])).toEqual([]);
@@ -101,6 +117,40 @@ describe("press cards", () => {
     expect(describeAction(action)).toBe('b1 ("Like"), b7.');
     expect(await pressProblems(ZEN, state, [{ control: "b7" }])).toContain("b7 isn't one of the controls");
     expect(await pressProblems(undefined, state, [{ control: "b1" }])).toBe("Kiki can't press anything in this window.");
+  });
+});
+
+describe("clicks", () => {
+  const control = (role: string, name: string): ControlTarget => ({ id: "b4", path: [0, 4], role, name, near: "" });
+
+  it("press links, tabs and plain buttons right away", () => {
+    expect(clickRefusal(control("link", "MIT license"))).toBeNull();
+    expect(clickRefusal(control("page tab", "Issues"))).toBeNull();
+    expect(clickRefusal(control("menu item", "Newest first"))).toBeNull();
+    expect(clickRefusal(control("push button", "Show more"))).toBeNull();
+  });
+
+  it("leave toggles and anything that changes something to a press card", () => {
+    expect(clickRefusal(control("toggle button", "Reactions"))).toContain("propose_press");
+    expect(clickRefusal(control("push button", "Like"))).toContain("b4 (Like) may change something");
+    for (const name of ["Send", "Delete repository", "Follow", "Buy now", "Sign out", "Star this repository", "Download ZIP"]) {
+      expect(clickRefusal(control("push button", name)), name).not.toBeNull();
+      expect(clickRefusal(control("link", name)), name).not.toBeNull();
+    }
+    // Unknown roles (a check box is a field) aren't clicked either.
+    expect(clickRefusal(control("check box", "Remember me"))).not.toBeNull();
+  });
+
+  it("only click controls Kiki read, and never one that needs a card", async () => {
+    const state = newScreenState();
+    screenText(`Jane: my code works ${marker(0, "Like")} ${marker(1, "Jane Doe")}`, [
+      { path: [0, 5, 2], role: "push button", name: "Like" },
+      { path: [0, 5, 3], role: "link", name: "Jane Doe" },
+    ], state);
+    const click = (control: string, source = ZEN) => clickControl(capture(source), state, { id: "t1", input: { control } }, ALL);
+    expect((await click("b9")).result).toMatchObject({ isError: true, content: expect.stringContaining("look or scroll first") });
+    expect((await click("b1")).result).toMatchObject({ isError: true, content: expect.stringContaining("propose_press") });
+    expect((await click("b2", { ...ZEN, pid: undefined })).result.content).toBe("Kiki can't click anything in this window.");
   });
 });
 
@@ -149,6 +199,7 @@ class Node:
     def get_text_iface(self): return self if "text" in self.spec else None
     def get_action_iface(self): return self
     def get_document_iface(self): return None
+    def get_component_iface(self): return None
     def get_child_count(self): return len(self.kids)
     def get_child_at_index(self, index): return self.kids[index]
 
@@ -195,6 +246,26 @@ ${code}`;
     ]);
   });
 
+  it("reads a container Firefox left without “showing” while its box is in view", () => {
+    const read = run(
+      `k.window_box = lambda obj: tuple(obj.spec["box"]) if "box" in obj.spec else None
+out = k.read_screen(None, Node({"role": "frame", "name": "Issues", "kids": [data]}))
+print(json.dumps(out["text"]))`,
+      {
+        role: "document_web",
+        box: [0, 0, 1000, 800],
+        kids: [
+          { role: "section", states: ["visible"], box: [200, -40, 800, 2000], kids: [{ role: "link", name: "TypeError: Missing parameter", text: "TypeError: Missing parameter" }] },
+          { role: "section", states: ["visible"], box: [200, 2400, 800, 900], kids: [{ role: "paragraph", text: "Further down" }] },
+          { role: "section", states: ["visible"], kids: [{ role: "paragraph", text: "Nowhere" }] },
+        ],
+      },
+    ) as string;
+    expect(read).toContain("TypeError: Missing parameter");
+    expect(read).not.toContain("Further down");
+    expect(read).not.toContain("Nowhere");
+  });
+
   it("finds text to scroll to nearest what's on screen, and by its first words when it runs on", () => {
     const found = run(
       `nodes = [(Node({"role": "paragraph", "name": str(i), "text": t}), t, s) for i, (t, s) in enumerate(data)]
@@ -207,6 +278,35 @@ print(json.dumps([getattr(k.find_text(nodes, wanted), "spec", {}).get("name") fo
       ],
     );
     expect(found).toEqual(["3", "3", "3", null]);
+  });
+
+  it("clicks, then waits for the page it opened to load and draw before reading the screen", () => {
+    const result = run(
+      `k.target_of = lambda request: Node({"role": "link", "name": "MIT license"})
+k.Atspi.Action.get_action_name = staticmethod(lambda iface, index: "jump")
+k.Atspi.Action.do_action = staticmethod(lambda iface, index: True)
+k.CLICK_QUIET_SECONDS, k.CLICK_SETTLE_SECONDS, k.CLICK_LOAD_SECONDS = 0.3, 0, 2
+frame = Node({"role": "frame", "name": "LICENSE", "kids": [data]})
+k.find_source = lambda pid, window: (None, frame)
+request = {"pid": 1, "window": [0], "path": [0, 2], "role": "link", "name": "MIT license"}
+urls = iter(["https://github.com/x/y", "https://github.com/x/y", "https://github.com/x/y?tab=MIT-1-ov-file"])
+k.page_url = lambda window: next(urls, "https://github.com/x/y?tab=MIT-1-ov-file")
+loading = iter([True, True, False])
+k.page_loading = lambda window: next(loading, False)
+# The address changes first; the page draws the license a moment later.
+screens = iter(["repo", "repo", "repo", "license", "license", "license"])
+k.read_screen = lambda app, window: {"text": next(screens, "after"), "windowTitle": "x/y"}
+opened = k.click(request)
+# A click that opens nothing reads the screen once it's still.
+k.page_url = lambda window: "https://github.com/x/y"
+screens = iter(["list", "list longer", "list longest", "list longest"])
+in_place = k.click(request)
+k.target_of = lambda request: Node({"role": "link", "name": "Apache license"})
+moved = k.click(request)
+print(json.dumps([opened["ok"], opened["navigated"], opened["text"], next(loading, "done"), in_place["navigated"], in_place["text"], moved]))`,
+      page,
+    );
+    expect(result).toEqual([true, true, "license", "done", false, "list longest", { ok: false, reason: "moved" }]);
   });
 
   it("presses a control only while it still says the same", () => {

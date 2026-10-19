@@ -1,4 +1,4 @@
-// The "Thinking…" feed above an answer: what Kiki thinks, searches, reads, opens and scrolls while it works,
+// The "Thinking…" feed above an answer: what Kiki thinks, searches, reads, opens, scrolls and clicks while it works,
 // collapsing to one line ("Thought for 6s · 2 searches · 5 sources") once the answer starts.
 import type { Activity, Source } from "@kiki/shared";
 import { formatSeconds, hostOf, paragraphs, plural, thoughtLine } from "./feed.ts";
@@ -6,13 +6,14 @@ import { icon, type IconName } from "./icons.ts";
 import { SwapText } from "./textfx.ts";
 
 /** What Kiki is doing right now, as the feed's title says it. */
-export type TracePhase = "thinking" | "searching" | "reading" | "scrolling";
+export type TracePhase = "thinking" | "searching" | "reading" | "scrolling" | "clicking";
 
 const PHASE_TITLES: Record<TracePhase, string> = {
   thinking: "Thinking…",
   searching: "Searching the web…",
   reading: "Reading…",
   scrolling: "Scrolling…",
+  clicking: "Clicking…",
 };
 
 /** The icon for a lookup or check line, by what it checks. */
@@ -49,8 +50,9 @@ export class Trace {
   readonly #reads = new Map<string, HTMLLIElement>();
   readonly #queries = new Set<string>();
   readonly #hosts = new Set<string>();
-  /** Scrolls of the person's window, for the summary. */
+  /** Scrolls of the person's window and clicks in it, for the summary. */
   #scrolls = 0;
+  #clicks = 0;
   #thinking = "";
   #paragraphs = 0;
   #frame = 0;
@@ -138,6 +140,16 @@ export class Trace {
         }
         const line = this.#line("scroll", icon(looking ? "eye" : "mouse", 12));
         line.append(el("span", "line-text", activity.label));
+        this.onChange();
+        break;
+      }
+      case "click": {
+        this.#clicks++;
+        this.setPhase("clicking");
+        const line = this.#line("click", icon("pointerClick", 12));
+        const text = el("span", "line-text", "Clicking ");
+        text.append(el("q", undefined, activity.label));
+        line.append(text);
         this.onChange();
         break;
       }
@@ -257,6 +269,7 @@ export class Trace {
       searches > 0 ? plural(searches, "search", "searches") : null,
       this.#hosts.size > 0 ? plural(this.#hosts.size, "source") : null,
       this.#scrolls > 0 ? plural(this.#scrolls, "scroll") : null,
+      this.#clicks > 0 ? plural(this.#clicks, "click") : null,
     ].filter(Boolean);
     this.#meta.textContent = stats.length > 0 ? `· ${stats.join(" · ")}` : "";
     if (this.#thinking.trim()) this.#full.textContent = this.#thinking.trim();
