@@ -2,14 +2,16 @@
 // checked against the text (or form) as it is now; when the person applies the card, they're written in:
 // over AT-SPI where the app takes writes (GTK), by selecting each piece over AT-SPI and pasting over it where
 // it doesn't (Firefox, Zen), or with Google Docs' own Find and replace.
+import { setTimeout as sleep } from "node:timers/promises";
 import { clipboard } from "electron";
 import type { FieldValue, FormField, TextChange, ToolResult } from "@kiki/shared";
 import type { ActionStatus } from "../shared-types.ts";
 import type { EditTarget, FieldTarget, FormTarget } from "./capture/common.ts";
 import { runHelper } from "./capture/linux.ts";
 import { clipboardForPaste, keepClipboard } from "./clipboard.ts";
-import { focusSource, keysToSource, pasteToSource } from "./gnomeShell.ts";
+import { focusSource, keysToSource, pasteToSource, type KeyStep } from "./gnomeShell.ts";
 import { plural } from "./google/format.ts";
+import { orderSteps, placeOf, selectPasteStep, writeStep, type Applied, type Place, type UndoStep } from "./undo.ts";
 
 /** Why a change can't go in, from the helper's --check-changes. */
 export type ChangeStatus = "ok" | "missing" | "ambiguous" | "spans" | "overlaps";
@@ -24,6 +26,8 @@ interface ApplyResult {
   ok: boolean;
   reason?: string;
   applied?: number[];
+  /** Where each applied change is now, for undoing it by span. */
+  written?: Array<{ index: number; path: number[]; role?: string | null; start: number; end: number }>;
   results?: Array<{ status: ChangeStatus; count: number }>;
 }
 
@@ -34,12 +38,6 @@ interface SelectResult {
   path?: number[] | null;
   role?: string | null;
   start?: number;
-}
-
-interface Place {
-  pid: number;
-  path: number[];
-  role?: string;
 }
 
 const quote = (text: string, max = 80) => JSON.stringify(text.length > max ? `${text.slice(0, max)}…` : text);
@@ -73,7 +71,7 @@ export async function checkChanges(target: EditTarget | undefined, changes: Text
   }
   if (!target?.atspi) return { content: "Kiki can't change the text in this window.", isError: true };
   try {
-    const result = await runHelper<CheckResult>(["--check-changes", JSON.stringify({ ...placeOf(target), changes })], 5_000);
+    const result = await runHelper<CheckResult>(["--check-changes", JSON.stringify({ ...atspiPlace(target), changes })], 5_000);
     if (!result.ok || !result.results) return { content: "Kiki can't read that text anymore; the window closed or changed.", isError: true };
     const problems = changeProblems(changes, result.results);
     return problems ? { content: problems, isError: true } : { content: `All ${plural(changes.length, "change")} fit the text.` };
@@ -82,9 +80,9 @@ export async function checkChanges(target: EditTarget | undefined, changes: Text
   }
 }
 
-function placeOf(target: EditTarget): Place {
-  const { pid, path, role } = target.atspi!;
-  return { pid, path, ...(role ? { role } : {}) };
+/** Where the target's text is over AT-SPI; only for a target that has it. */
+function atspiPlace(target: EditTarget): Place {
+  return placeOf(target.atspi!.pid, target.atspi!);
 }
 
 /**
@@ -144,7 +142,8 @@ export async function selectAndPaste(
   return { ...selected, pasted: true, ok: await landed(place.pid, selected, text) };
 }
 
-const REASONS: Record<string, string> = {
+/** What a card says when the helper couldn't do a step, by the helper's reason; undo steps say the same. */
+export const HELPER_REASONS: Record<string, string> = {
   missing: "isn't there anymore",
   ambiguous: "is there more than once now",
   spans: "runs across two lines",
@@ -162,47 +161,64 @@ function summary(done: number, total: number, noun: string, verb: string, where:
   return `${verb} ${count}${where}.${failed.length ? ` Not ${verb.toLowerCase()}: ${failed.join("; ")}.` : ""}`;
 }
 
-/** Runs a changes card's button. Throws with a message for the card when nothing went in. */
+/**
+ * Runs a changes card's button. Throws with a message for the card when nothing went in. `signal` stops it
+ * between changes. What it returns says how to undo the changes that went in.
+ */
 export async function applyChanges(
   target: EditTarget | undefined,
   changes: TextChange[],
   mode: "apply" | "copy",
   appName: string | undefined,
-): Promise<ActionStatus> {
+  signal?: AbortSignal,
+): Promise<Applied> {
   if (mode === "copy") {
     if (!target?.full) throw new Error("Kiki doesn't have the whole text to copy.");
     await clipboard.writeText(newText(target.full.text, changes));
-    return { outcome: "copied", message: "Copied the whole text with the changes." };
+    return { status: { outcome: "copied", message: "Copied the whole text with the changes." } };
   }
   const where = appName ? ` in ${appName}` : "";
-  if (target?.kind === "docs") return applyInDocs(target, changes, where);
+  if (target?.kind === "docs") return applyInDocs(target, changes, where, signal);
   if (!target?.atspi) throw new Error("Kiki can't change the text in this window.");
 
   const failed: string[] = [];
+  const steps: UndoStep[] = [];
   let done = 0;
   if (!target.selectPaste) {
-    const result = await runHelper<ApplyResult>(["--apply-changes", JSON.stringify({ ...placeOf(target), changes })], 10_000).catch(
+    const result = await runHelper<ApplyResult>(["--apply-changes", JSON.stringify({ ...atspiPlace(target), changes })], 10_000).catch(
       (error: unknown): ApplyResult => ({ ok: false, reason: String(error) }),
     );
     done = result.applied?.length ?? 0;
     if (!result.ok && result.results) {
       const problems = changes.flatMap((change, index) =>
-        result.results![index]?.status === "ok" ? [] : [`${quote(change.find, 40)} (${REASONS[result.results![index]!.status] ?? "failed"})`],
+        result.results![index]?.status === "ok" ? [] : [`${quote(change.find, 40)} (${HELPER_REASONS[result.results![index]!.status] ?? "failed"})`],
       );
       throw new Error(`The text changed since Kiki read it: ${problems.join("; ")}. Ask again, or copy this.`);
     }
     if (!result.ok && done === 0) throw new Error("Kiki couldn't write there. Copy the text instead.");
     if (!result.ok) failed.push(`${changes.length - done} (the app refused a write)`);
+    // The helper wrote from the last change to the first; undoing in that order keeps each span where it is.
+    for (const span of result.written ?? []) {
+      const change = changes[span.index];
+      if (change) steps.push(writeStep(placeOf(target.atspi.pid, span), span.start, change.replace, change.find));
+    }
   } else {
     // The person's clipboard comes back afterwards: Kiki pasted several times through it.
     const restore = await keepClipboard();
     try {
       // Only the first change starts with the keyboard on Kiki: each one hands it to the window.
       for (const [index, change] of [...changes].reverse().entries()) {
-        const result = await selectAndPaste(placeOf(target), { find: change.find }, change.replace, index === 0);
+        if (signal?.aborted) {
+          failed.push(`${plural(changes.length - index, "change")} (stopped)`);
+          break;
+        }
+        const result = await selectAndPaste(atspiPlace(target), { find: change.find }, change.replace, index === 0);
         if (result.ok) done++;
         else if (result.pasted) failed.push(`${quote(change.find, 40)} (pasted, but Kiki couldn't confirm it)`);
-        else failed.push(`${quote(change.find, 40)} (${REASONS[result.reason ?? ""] ?? "failed"})`);
+        else failed.push(`${quote(change.find, 40)} (${HELPER_REASONS[result.reason ?? ""] ?? "failed"})`);
+        if (result.pasted && result.path && result.start !== undefined) {
+          steps.push(selectPasteStep(placeOf(target.atspi.pid, { path: result.path, role: result.role }), result.start, change.replace, change.find));
+        }
         if (result.reason === "focus" || result.reason === "helper") break;
       }
     } finally {
@@ -213,7 +229,10 @@ export async function applyChanges(
     }
   }
   if (target.full) target.full = { ...target.full, text: newText(target.full.text, changes) };
-  return { outcome: "applied", message: summary(done, changes.length, "change", "Applied", where, failed) };
+  return {
+    status: { outcome: "applied", message: summary(done, changes.length, "change", "Applied", where, failed) },
+    ...(steps.length ? { undo: { steps: orderSteps(steps), skipped: [] } } : {}),
+  };
 }
 
 /** The parts of Docs' Find and replace dialog Kiki uses, from --docs-dialog. */
@@ -246,8 +265,6 @@ export function docsMatches(count: string | null): number | null {
   return match ? Number(match[2]) : null;
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
 async function docsDialog(pid: number, wait: number): Promise<DocsDialog | null> {
   try {
     const result = await runHelper<{ ok: boolean } & DocsDialog>(["--docs-dialog", JSON.stringify({ pid, wait })], (wait + 5) * 1_000);
@@ -257,16 +274,21 @@ async function docsDialog(pid: number, wait: number): Promise<DocsDialog | null>
   }
 }
 
+async function pressResult(pid: number, item: { path: number[]; role?: string }, checked?: boolean): Promise<{ ok: boolean; changed?: boolean }> {
+  const request = { ...placeOf(pid, item), ...(checked === undefined ? {} : { checked }) };
+  return runHelper<{ ok: boolean; changed?: boolean }>(["--press", JSON.stringify(request)], 5_000).catch(() => ({ ok: false }));
+}
+
 async function press(pid: number, item: { path: number[]; role?: string }, checked?: boolean): Promise<boolean> {
-  const request = { pid, path: item.path, ...(item.role ? { role: item.role } : {}), ...(checked === undefined ? {} : { checked }) };
-  return (await runHelper<{ ok: boolean }>(["--press", JSON.stringify(request)], 5_000).catch(() => ({ ok: false }))).ok;
+  return (await pressResult(pid, item, checked)).ok;
 }
 
 /**
  * Makes each change with Google Docs' Find and replace: Ctrl+H opens it, Kiki pastes the text to find and
- * goes on only when Docs counts exactly one match, then pastes the replacement and presses Replace all.
+ * goes on only when Docs counts exactly one match, then pastes the replacement and presses Replace all. Each
+ * Replace all is one step in Docs' own undo, so Ctrl+Z that many times takes them back.
  */
-async function applyInDocs(target: EditTarget, changes: TextChange[], where: string): Promise<ActionStatus> {
+async function applyInDocs(target: EditTarget, changes: TextChange[], where: string, signal?: AbortSignal): Promise<Applied> {
   if (!target.keys || !target.pid) {
     throw new Error("Update Kiki's GNOME helper in Settings (then log out and back in) so Kiki can use Docs' Find and replace.");
   }
@@ -287,10 +309,14 @@ async function applyInDocs(target: EditTarget, changes: TextChange[], where: str
     // match (any case) still means at most one exact one.
     if (parts.matchCase) await press(pid, parts.matchCase, true);
     if (parts.regex && !(await press(pid, parts.regex, false))) throw new Error("Kiki couldn't turn off regular expressions in Docs.");
-    for (const change of changes) {
-      const typed = await selectAndPaste(place(pid, parts.find), { all: true }, change.find, false);
+    for (const [index, change] of changes.entries()) {
+      if (signal?.aborted) {
+        failed.push(`${plural(changes.length - index, "change")} (stopped)`);
+        break;
+      }
+      const typed = await selectAndPaste(placeOf(pid, parts.find), { all: true }, change.find, false);
       if (typed.reason === "helper") {
-        failed.push(`${quote(change.find, 40)} (${REASONS.helper})`);
+        failed.push(`${quote(change.find, 40)} (${HELPER_REASONS.helper})`);
         break;
       }
       if (!typed.pasted) {
@@ -303,7 +329,7 @@ async function applyInDocs(target: EditTarget, changes: TextChange[], where: str
         failed.push(`${quote(change.find, 40)} (${matches === null ? "Docs showed no count" : `found ${plural(matches, "time")}`})`);
         continue;
       }
-      const replaced = await selectAndPaste(place(pid, parts.replace), { all: true }, change.replace, false);
+      const replaced = await selectAndPaste(placeOf(pid, parts.replace), { all: true }, change.replace, false);
       if (!replaced.pasted && change.replace) {
         failed.push(`${quote(change.find, 40)} (couldn't type the replacement)`);
         continue;
@@ -320,11 +346,11 @@ async function applyInDocs(target: EditTarget, changes: TextChange[], where: str
     await restore();
   }
   if (done === 0) throw new Error(`Kiki couldn't make these changes: ${failed.join("; ")}.`);
-  return { outcome: "applied", message: summary(done, changes.length, "change", "Applied", where, failed) };
-}
-
-function place(pid: number, item: { path: number[]; role?: string }): Place {
-  return { pid, path: item.path, ...(item.role ? { role: item.role } : {}) };
+  const undo: KeyStep[] = Array.from({ length: done }, () => "ctrl+z" as const);
+  return {
+    status: { outcome: "applied", message: summary(done, changes.length, "change", "Applied", where, failed) },
+    undo: { steps: [{ type: "keys", steps: undo }], skipped: [] },
+  };
 }
 
 /** What Claude hears about values that don't fit the form; null when they all do. */
@@ -345,51 +371,111 @@ export function fillProblems(form: FormTarget | undefined, values: FieldValue[])
   return lines.length ? `${lines.join("\n")}\nPropose the fill again with these fixed or left out.` : null;
 }
 
-/** The fields as Claude sees them, without where they are. */
-export function formFields(form: FormTarget): FormField[] {
-  return form.fields.map(({ path: _path, role: _role, length: _length, ...field }) => field);
+/** A field as Claude sees it, without where it is. */
+export function publicField({ path: _path, role: _role, length: _length, ...field }: FieldTarget): FormField {
+  return field;
 }
 
-async function fillOne(form: FormTarget, field: FieldTarget, value: string | boolean, kikiHasKeyboard: boolean): Promise<string | null> {
-  const where = place(form.pid, field);
-  if (typeof value === "boolean") return (await press(form.pid, field, value)) ? null : "couldn't be clicked";
+/** The fields as Claude sees them. */
+export function formFields(form: FormTarget): FormField[] {
+  return form.fields.map(publicField);
+}
+
+/** What filling one field did: the problem when it failed, else how to undo it (or why that's not possible). */
+interface Filled {
+  problem: string | null;
+  undo?: UndoStep;
+  skipped?: string;
+}
+
+async function fillOne(form: FormTarget, field: FieldTarget, value: string | boolean, kikiHasKeyboard: boolean): Promise<Filled> {
+  const where = placeOf(form.pid, field);
+  if (typeof value === "boolean") {
+    const result = await pressResult(form.pid, field, value);
+    if (!result.ok) return { problem: "couldn't be clicked" };
+    // The option a radio button took over from isn't known, so it can't be put back.
+    if (field.kind === "radio") return { problem: null, skipped: `${field.label} (a radio button)` };
+    return { problem: null, ...(result.changed ? { undo: { type: "toggle", ...where, checked: !value } } : {}) };
+  }
+  const old = field.value ?? "";
+  // Kiki keeps only the start of a long value, so it can't put all of it back.
+  const skipped = field.length !== undefined && field.length > old.length ? `${field.label} (its old text was longer than Kiki keeps)` : undefined;
   if (!form.selectPaste) {
-    const request = { ...where, start: 0, expected: field.value ?? "", text: value, whole: true };
+    const request = { ...where, start: 0, expected: old, text: value, whole: true };
     const result = await runHelper<{ ok: boolean; reason?: string }>(["--edit", JSON.stringify(request)], 5_000).catch(() => ({
       ok: false,
       reason: "failed",
     }));
-    if (result.ok) return null;
-    return result.reason === "changed" ? "changed since Kiki read it" : "didn't take the text";
+    if (!result.ok) return { problem: result.reason === "changed" ? "changed since Kiki read it" : "didn't take the text" };
+    return { problem: null, ...(skipped ? { skipped } : { undo: writeStep(where, 0, value, old, true) }) };
   }
-  const result = await selectAndPaste(where, { all: true, expected: field.value ?? "" }, value, kikiHasKeyboard);
-  if (result.ok) return null;
-  return result.pasted ? "pasted, but Kiki couldn't confirm it" : (REASONS[result.reason ?? ""] ?? "failed");
+  const result = await selectAndPaste(where, { all: true, expected: old }, value, kikiHasKeyboard);
+  if (!result.ok) return { problem: result.pasted ? "pasted, but Kiki couldn't confirm it" : (HELPER_REASONS[result.reason ?? ""] ?? "failed") };
+  const landed = result.path ? placeOf(form.pid, { path: result.path, role: result.role }) : where;
+  return { problem: null, ...(skipped ? { skipped } : { undo: selectPasteStep(landed, result.start ?? 0, value, old, true) }) };
 }
 
-/** Runs a fill card's Fill button. Throws with a message for the card when nothing was filled. */
-export async function applyFill(form: FormTarget | undefined, values: FieldValue[], appName: string | undefined): Promise<ActionStatus> {
+/**
+ * Puts one value in one field right away (an `act` step), the way a fill card would: over AT-SPI, or with a
+ * select-all and a paste in a browser, with the clipboard kept. Returns an error for the model, or null.
+ */
+export async function fillField(form: FormTarget | undefined, fieldId: string, value: string | boolean): Promise<string | null> {
+  if (!form) return "There's no form Kiki can type into here.";
+  const field = form.fields.find((candidate) => candidate.id === fieldId);
+  if (!field) return `${fieldId || "That"} isn't one of the fields in <form_fields>: look first, and use the ids there.`;
+  const problem = fillProblems(form, [{ field: fieldId, value }]);
+  if (problem) return problem;
+  const restore = form.selectPaste ? await keepClipboard() : async () => {};
+  try {
+    const filled = await fillOne(form, field, value, true);
+    if (filled.problem) return `Kiki couldn't fill ${fieldId} (${field.label}): it ${filled.problem}.`;
+    if (typeof value === "boolean") field.checked = value;
+    else field.value = value.slice(0, 200);
+    return null;
+  } finally {
+    await restore();
+  }
+}
+
+/**
+ * Runs a fill card's Fill button. Throws with a message for the card when nothing was filled. `signal` stops
+ * it between fields. What it returns says how to put the old values back.
+ */
+export async function applyFill(
+  form: FormTarget | undefined,
+  values: FieldValue[],
+  appName: string | undefined,
+  signal?: AbortSignal,
+): Promise<Applied> {
   if (!form) throw new Error("Kiki can't fill a form in this window.");
   const restore = form.selectPaste ? await keepClipboard() : async () => {};
   const failed: string[] = [];
   const needHelper: string[] = [];
+  const steps: UndoStep[] = [];
+  const skipped: string[] = [];
   let done = 0;
   // Until the first paste hands the keyboard to the window; check boxes are clicked without it.
   let kikiHasKeyboard = true;
   try {
-    for (const item of values) {
+    for (const [index, item] of values.entries()) {
+      if (signal?.aborted) {
+        failed.push(`${plural(values.length - index, "field")} (stopped)`);
+        break;
+      }
       const field = form.fields.find((candidate) => candidate.id === item.field);
-      const problem = field ? await fillOne(form, field, item.value, kikiHasKeyboard) : "isn't on the page anymore";
+      const filled: Filled = field ? await fillOne(form, field, item.value, kikiHasKeyboard) : { problem: "isn't on the page anymore" };
       if (field && form.selectPaste && typeof item.value === "string") kikiHasKeyboard = false;
-      if (problem === REASONS.helper) {
+      if (filled.problem === HELPER_REASONS.helper) {
         needHelper.push(field!.label);
         continue;
       }
-      if (problem) {
-        failed.push(`${field?.label || item.field} (${problem})`);
+      if (filled.problem) {
+        failed.push(`${field?.label || item.field} (${filled.problem})`);
         continue;
       }
       done++;
+      if (filled.undo) steps.push(filled.undo);
+      if (filled.skipped) skipped.push(filled.skipped);
       // What's there now, for the next fill.
       if (typeof item.value === "boolean") field!.checked = item.value;
       else field!.value = item.value.slice(0, 200);
@@ -397,7 +483,11 @@ export async function applyFill(form: FormTarget | undefined, values: FieldValue
   } finally {
     await restore();
   }
-  if (needHelper.length > 0) failed.push(`${needHelper.join(", ")} (${REASONS.helper})`);
+  if (needHelper.length > 0) failed.push(`${needHelper.join(", ")} (${HELPER_REASONS.helper})`);
   if (done === 0) throw new Error(`Kiki couldn't fill these: ${failed.join("; ")}.`);
-  return { outcome: "applied", message: summary(done, values.length, "field", "Filled", appName ? ` in ${appName}` : "", failed) };
+  return {
+    status: { outcome: "applied", message: summary(done, values.length, "field", "Filled", appName ? ` in ${appName}` : "", failed) },
+    // The last field first, so each one is still what Kiki left it when its turn comes.
+    ...(steps.length ? { undo: { steps: steps.reverse(), skipped } } : {}),
+  };
 }

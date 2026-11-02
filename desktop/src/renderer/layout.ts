@@ -2,7 +2,7 @@
 // size and where the box sits in it live in the GNOME extension's placement.js, which everything shares.
 import { CARD_WIDTH, INSETS } from "../../resources/gnome-extension/kiki-popup@kiki.app/placement.js";
 
-export { cardBottomIn, CARD_WIDTH, INSETS } from "../../resources/gnome-extension/kiki-popup@kiki.app/placement.js";
+export { cardBottomIn, INSETS } from "../../resources/gnome-extension/kiki-popup@kiki.app/placement.js";
 
 export const POPUP_WIDTH = INSETS.left + CARD_WIDTH + INSETS.right;
 

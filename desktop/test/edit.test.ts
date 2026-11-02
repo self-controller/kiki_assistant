@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { ProposedAction } from "@kiki/shared";
 import { describe, expect, it } from "vitest";
 import type { EditTarget } from "../src/main/capture/common.ts";
-import { linuxEditTarget } from "../src/main/capture/linux.ts";
+import { linuxEditTarget, withoutText } from "../src/main/capture/linux.ts";
 import { editInfo, retarget } from "../src/main/edit.ts";
 import { applyEdits, describeAction } from "../src/main/google/format.ts";
 
@@ -58,6 +58,38 @@ describe("linuxEditTarget", () => {
     expect(linuxEditTarget({ ok: true, source: "none" }, "", true)).toMatchObject({ mode: "insert" });
     expect(linuxEditTarget({ ok: true, source: "document", text: "An article." }, "article", true)).toBeUndefined();
     expect(linuxEditTarget({ ok: false, error: "timed out" }, "article", true)).toBeUndefined();
+  });
+
+  it("knows a page has text when the quick read left it for later", () => {
+    expect(linuxEditTarget({ ok: true, source: "document", text: "", hasText: true }, "article", true)).toBeUndefined();
+    expect(linuxEditTarget({ ok: true, source: "window", text: "", hasText: false }, "", true)).toMatchObject({ kind: "unknown" });
+  });
+});
+
+describe("withoutText", () => {
+  it("keeps what's highlighted and the cursor, and drops the text around them", () => {
+    const vicinity = { kind: "editor" as const, before: "let ", anchor: "teh c", after: " = 1;" };
+    const context = withoutText({
+      ok: true,
+      source: "editor",
+      selection: "teh c",
+      vicinity,
+      edit: { ...FIELD, full: { text: "let teh c = 1;" } },
+    });
+    expect(context).toEqual({ ok: true, source: "editor", selection: "teh c", edit: FIELD, hasText: true });
+    // Without its text, an editor is still somewhere to write in, not an app that shares none.
+    expect(linuxEditTarget(withoutText({ ok: true, source: "editor", vicinity }), "", true)).toBeUndefined();
+    expect(withoutText({ ok: true, source: "none" })).toEqual({ ok: true, source: "none" });
+  });
+
+  it("drops a page's text and its form", () => {
+    const fields = [{ path: [1], label: "Name", kind: "text" as const, onScreen: true, value: "Ada" }];
+    expect(withoutText({ ok: true, source: "document", text: "An article.", focus: 3, fields, url: "https://a.example" })).toEqual({
+      ok: true,
+      source: "document",
+      url: "https://a.example",
+      hasText: true,
+    });
   });
 });
 

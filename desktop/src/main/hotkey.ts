@@ -1,4 +1,5 @@
 import { globalShortcut } from "electron";
+import { isWayland } from "./windows.ts";
 
 let onHotkey: () => void = () => {};
 
@@ -13,7 +14,7 @@ export function setHotkeyHandler(handler: () => void): void {
  */
 export function registerHotkey(accelerator: string): string | undefined {
   globalShortcut.unregisterAll();
-  if (process.platform === "linux" && process.env.WAYLAND_DISPLAY) return undefined;
+  if (isWayland) return undefined;
   try {
     if (globalShortcut.register(accelerator, () => onHotkey())) return undefined;
     return `Couldn't use ${accelerator} as the hotkey; another app may already use it.`;

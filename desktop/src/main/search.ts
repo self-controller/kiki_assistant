@@ -1,5 +1,5 @@
 // Opens the searches Claude asks for (`open_search`) in the person's browser. The URL is built here from a
-// fixed list of places, never taken from the server, so all Kiki can ever open this way is a search.
+// fixed list of places, never taken from the model, so all Kiki can ever open this way is a search.
 import {
   LIMITS,
   SEARCH_PLACES,
@@ -9,6 +9,7 @@ import {
   type ToolResult,
 } from "@kiki/shared";
 import { shell } from "electron";
+import { errorMessage } from "./errors.ts";
 
 function isPlace(value: unknown): value is SearchPlace {
   return (SEARCH_PLACES as readonly unknown[]).includes(value);
@@ -46,6 +47,6 @@ export async function openSearch(id: string, input: Record<string, unknown>): Pr
     await shell.openExternal(url);
     return { id, content: "Opened it in a new tab of the person's browser." };
   } catch (error) {
-    return { id, content: `Couldn't open the browser: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+    return { id, content: `Couldn't open the browser: ${errorMessage(error)}`, isError: true };
   }
 }

@@ -3,6 +3,7 @@
 // change something are pressed with a press card instead. Kiki's GNOME extension scrolls any app with a virtual
 // touchpad (v8); before that, web pages scroll over AT-SPI. The text comes from AT-SPI, and a screenshot of the
 // window when the camera is on.
+import { setTimeout as sleep } from "node:timers/promises";
 import {
   LIMITS,
   type FormField,
@@ -14,8 +15,9 @@ import {
 } from "@kiki/shared";
 import type { ActionStatus } from "../shared-types.ts";
 import type { Capture, FieldTarget, FormTarget, SourceWindow } from "./capture/common.ts";
-import { runHelper, SELECT_PASTE_TOOLKITS, type HelperField } from "./capture/linux.ts";
-import { scrollSource, type ScrollOutcome } from "./gnomeShell.ts";
+import { fieldState, fieldTarget, runHelper, SELECT_PASTE_TOOLKITS, type HelperField } from "./capture/linux.ts";
+import { publicField } from "./changes.ts";
+import { clickAt, dragPath, keyChord, scrollSource, type PointerOutcome, type ScrollOutcome } from "./gnomeShell.ts";
 import { plural } from "./google/format.ts";
 
 /**
@@ -37,6 +39,9 @@ const LOAD_MORE_MS = 1_000;
 const CLICK_TIMEOUT_MS = 14_000;
 /** How much of the text before a control a press card shows. */
 const NEAR_CHARS = 100;
+/** Lines a screen shares with the one before are left out when there are at least this many, or this much text. */
+const SHARED_LINES = 3;
+const SHARED_CHARS = 40;
 
 /** A button or link a screen read found, as Kiki keeps it to press later. */
 export interface ControlTarget {
@@ -46,6 +51,12 @@ export interface ControlTarget {
   name: string;
   /** The text just before it on screen, for the card. */
   near: string;
+  /** Kiki's browser: the control's accessible name alone (without its state), to find it again when it moves. */
+  axName?: string;
+  /** Kiki's browser: the document the control was read in; an earlier one's controls are stale. */
+  epoch?: number;
+  /** Kiki's browser: one of a cookie or consent notice's own buttons (Accept all, Reject all…). */
+  consent?: boolean;
 }
 
 /** What Kiki read on screen during a popup session: the controls it gave ids to, and the last read. */
@@ -66,12 +77,16 @@ export interface ScreenAccess {
   text: boolean;
   window: boolean;
   screenshot: boolean;
+  /** Clicks and drags at coordinates in a screenshot are allowed (Settings, and the GNOME helper v13). */
+  coordinates?: boolean;
 }
 
 interface HelperControl {
   path: number[];
   role?: string | null;
   name: string;
+  axName?: string;
+  epoch?: number;
 }
 
 interface HelperScreen {
@@ -109,8 +124,27 @@ export function screenTools(
   return { screen: true, press: true, click: true, ...(fillable ? { fill: true } : {}) };
 }
 
-/** Controls a click may press right away (AT-SPI role names): links, tabs, menu items and plain buttons. */
-const CLICK_ROLES = new Set(["link", "page tab", "menu item", "push button", "button"]);
+/**
+ * Controls a click may press right away: links, tabs, menu items, tree and list entries, and plain buttons, by
+ * their AT-SPI role names (windows) and Chrome's (Kiki's browser).
+ */
+const CLICK_ROLES = new Set([
+  "link",
+  "page tab",
+  "tab",
+  "menu item",
+  "menuitem",
+  "push button",
+  "button",
+  "treeitem",
+  "tree item",
+  "option",
+  "listboxoption",
+  "menulistoption",
+  "list item",
+  "disclosuretriangle",
+  "popupbutton",
+]);
 
 /**
  * What a control that changes something says. Claude is told to put those on a press card; this keeps a click
@@ -119,11 +153,22 @@ const CLICK_ROLES = new Set(["link", "page tab", "menu item", "push button", "bu
 const CHANGES_SOMETHING =
   /\b(send|submit|post|publish|reply|comment|delete|remove|discard|archive|buy|order|pay|checkout|check out|purchase|subscribe|unsubscribe|follow|unfollow|like|unlike|react|share|repost|retweet|star|unstar|fork|save|block|report|mute|sign (in|out|up)|log ?(in|out)|confirm|accept|decline|approve|merge|install|download|upload|vote|upvote|downvote)\b/i;
 
+/** What pays: with "Act without asking" on, these still wait for the person on a press card. */
+const PAYS = /\b(pay|pay now|checkout|check out|purchase|buy( now)?|place (your )?order|complete (your )?order|confirm (your )?(order|payment|purchase)|subscribe( now)?)\b/i;
+
 /**
  * Why a click can't press this control right away, for Claude: a toggle (a like, a follow) or one that says it
- * changes something goes on a press card, so the person approves it. Null when a click can press it.
+ * changes something goes on a press card, so the person approves it. Null when a click can press it. With
+ * "Act without asking" on (`auto`), any control may be clicked except one that pays.
  */
-export function clickRefusal(control: ControlTarget): string | null {
+export function clickRefusal(control: ControlTarget, options: { auto?: boolean } = {}): string | null {
+  // A cookie notice's answer is fine to give (the prompt says so): it's in the way, and changes nothing else.
+  if (control.consent && !PAYS.test(control.name)) return null;
+  if (options.auto) {
+    return PAYS.test(control.name)
+      ? `${control.id} (${control.name}) looks like it pays for something, so the person has to approve it: put it on a propose_press card instead.`
+      : null;
+  }
   const changes = !CLICK_ROLES.has(control.role ?? "") || CHANGES_SOMETHING.test(control.name);
   return changes
     ? `${control.id} (${control.name}) may change something, so the person has to approve it: put it on a propose_press card instead.`
@@ -143,8 +188,21 @@ function controlId(state: ScreenState, control: HelperControl, near: string): st
     id = `b${state.controls.size + 1}`;
     state.ids.set(key, id);
   }
-  state.controls.set(id, { id, path: control.path, ...(control.role ? { role: control.role } : {}), name: control.name, near });
+  state.controls.set(id, {
+    id,
+    path: control.path,
+    ...(control.role ? { role: control.role } : {}),
+    name: control.name,
+    near,
+    ...(control.axName !== undefined ? { axName: control.axName } : {}),
+    ...(control.epoch !== undefined ? { epoch: control.epoch } : {}),
+  });
   return id;
+}
+
+/** The id a read gave `control` (see `screenText`), or undefined when it hasn't had one. */
+export function controlIdFor(state: ScreenState, control: HelperControl): string | undefined {
+  return state.ids.get(controlKey(control));
 }
 
 const MARKER = /(\d+)([^]*)/g;
@@ -161,6 +219,97 @@ export function screenText(text: string, controls: HelperControl[], state: Scree
     const before = clean.slice(Math.max(0, offset - NEAR_CHARS * 3), offset).replace(MARKER, "$2");
     return `⟦${controlId(state, control, nearText(before))} ${label}⟧`;
   });
+}
+
+/** A control's index in its marker, which changes from one read to the next while the control stays. */
+const MARKER_INDEX = /\ue001\d+/g;
+
+/**
+ * `current` (a screen's raw text) without the lines it shares with `previous` (the screen before it): after a
+ * scroll down, a screen starts with the end of the last one; after a scroll up, it ends with its start. The
+ * shared lines become one note, so Claude reads each post once. Small overlaps (a heading, a blank line) stay.
+ */
+export function dedupeScreen(previous: string | undefined, current: string, direction: "down" | "up"): { text: string; shared: number } {
+  if (!previous || !current) return { text: current, shared: 0 };
+  const key = (line: string) => line.replace(MARKER_INDEX, "\ue001");
+  const before = previous.split("\n").map(key);
+  const lines = current.split("\n");
+  const now = lines.map(key);
+  let shared = 0;
+  for (let count = Math.min(before.length, now.length); count >= 1 && shared === 0; count--) {
+    const tail = direction === "down" ? before.slice(before.length - count) : now.slice(now.length - count);
+    const head = direction === "down" ? now.slice(0, count) : before.slice(0, count);
+    if (tail.every((line, index) => line === head[index])) shared = count;
+  }
+  if (shared === 0) return { text: current, shared: 0 };
+  const overlap = direction === "down" ? lines.slice(0, shared) : lines.slice(lines.length - shared);
+  if (shared < SHARED_LINES && overlap.join("\n").trim().length < SHARED_CHARS) return { text: current, shared: 0 };
+  if (shared === lines.length) return { text: "(Nothing new: all of this screen was on the previous one.)", shared };
+  const rest = direction === "down" ? lines.slice(shared) : lines.slice(0, lines.length - shared);
+  const note = `(The ${direction === "down" ? "first" : "last"} ${shared === 1 ? "line was" : `${shared} lines were`} on the previous screen.)`;
+  return { text: direction === "down" ? `${note}\n${rest.join("\n")}` : `${rest.join("\n")}\n${note}`, shared };
+}
+
+/** Unchanged lines around a change that stay in a diff. */
+const DIFF_CONTEXT = 1;
+/** A diff is sent only when at least this share of the screen's lines didn't change. */
+const DIFF_MIN_SAME = 0.5;
+/** Runs of unchanged lines shorter than this stay as they are. */
+const DIFF_MIN_RUN = 4;
+
+/**
+ * `current` (a screen's text) as what changed since `previous` (the last read of the same page): runs of lines
+ * both have are replaced by one note, with a line of context either side, so Claude reads only what's new
+ * after a click that changed part of the page. The whole text when the page changed too much (under half its
+ * lines unchanged), or nothing: a note that it's the same. Control ids are stable, so the ids in the
+ * unchanged lines still work.
+ */
+export function diffScreen(previous: string | undefined, current: string): { text: string; diffed: boolean } {
+  if (!previous || !current) return { text: current, diffed: false };
+  if (previous === current) return { text: "(The page reads the same as your last look.)", diffed: true };
+  const before = previous.split("\n");
+  const lines = current.split("\n");
+  // The longest common subsequence of lines, by a table of its lengths.
+  const table: Uint16Array[] = Array.from({ length: before.length + 1 }, () => new Uint16Array(lines.length + 1));
+  for (let i = before.length - 1; i >= 0; i--) {
+    for (let j = lines.length - 1; j >= 0; j--) {
+      table[i]![j] = before[i] === lines[j] ? table[i + 1]![j + 1]! + 1 : Math.max(table[i + 1]![j]!, table[i]![j + 1]!);
+    }
+  }
+  const same = new Array<boolean>(lines.length).fill(false);
+  for (let i = 0, j = 0; i < before.length && j < lines.length; ) {
+    if (before[i] === lines[j]) {
+      same[j] = true;
+      i++;
+      j++;
+    } else if (table[i + 1]![j]! >= table[i]![j + 1]!) i++;
+    else j++;
+  }
+  const unchanged = same.filter(Boolean).length;
+  if (unchanged < lines.length * DIFF_MIN_SAME) return { text: current, diffed: false };
+  const out: string[] = [];
+  for (let j = 0; j < lines.length; ) {
+    if (!same[j]) {
+      out.push(lines[j]!);
+      j++;
+      continue;
+    }
+    let end = j;
+    while (end < lines.length && same[end]) end++;
+    // Context at either end of the run (not at the screen's edges), the rest folded into a note.
+    const head = j === 0 ? 0 : DIFF_CONTEXT;
+    const tail = end === lines.length ? 0 : DIFF_CONTEXT;
+    const folded = end - j - head - tail;
+    if (folded < DIFF_MIN_RUN) {
+      out.push(...lines.slice(j, end));
+    } else {
+      out.push(...lines.slice(j, j + head));
+      out.push(`(… ${folded} lines unchanged, as in your last look …)`);
+      out.push(...lines.slice(end - tail, end));
+    }
+    j = end;
+  }
+  return { text: out.join("\n"), diffed: true };
 }
 
 /** The last words before a control, on one line: what a press card shows to say which one it is. */
@@ -192,29 +341,18 @@ export function mergeFields(capture: Capture, source: SourceWindow, found: Helpe
   let next = lastFieldId(form) + 1;
   const seen: FieldTarget[] = [];
   for (const field of onScreen) {
-    const toggle = field.kind === "checkbox" || field.kind === "radio";
-    const now = toggle
-      ? { checked: Boolean(field.checked) }
-      : { value: field.value ?? "", ...(field.length !== undefined ? { length: field.length } : {}) };
     let target = byKey.get(fieldKey(field));
     if (target) {
-      Object.assign(target, now);
+      Object.assign(target, fieldState(field));
     } else {
       if (next > 999) continue;
-      target = {
-        id: `f${next++}`,
-        label: field.label,
-        kind: field.kind,
-        path: field.path,
-        ...(field.role ? { role: field.role } : {}),
-        ...now,
-      };
+      target = fieldTarget(`f${next++}`, field);
       form.fields.push(target);
       byKey.set(fieldKey(field), target);
     }
     seen.push(target);
   }
-  return seen.slice(0, LIMITS.formFields).map(({ path: _path, role: _role, length: _length, ...field }) => field);
+  return seen.slice(0, LIMITS.formFields).map(publicField);
 }
 
 function lastFieldId(form: FormTarget): number {
@@ -229,6 +367,8 @@ function leaveForm(capture: Capture): void {
   if (capture.form) capture.form = { ...capture.form, fields: [], lastId: lastFieldId(capture.form) };
 }
 
+const OUTCOME_ERRORS_GONE = "The window is closed, so Kiki can't act in it.";
+
 const OUTCOME_ERRORS: Record<Exclude<ScrollOutcome, "scrolled">, string> = {
   gone: "The window the question came from is closed, so Kiki can't scroll it.",
   hidden: "The window is minimized or on another workspace: ask the person to bring it back, then try again.",
@@ -236,12 +376,68 @@ const OUTCOME_ERRORS: Record<Exclude<ScrollOutcome, "scrolled">, string> = {
   covered: "Other windows cover the one the question came from: ask the person to move them, then try again.",
 };
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-type Step = { ok: true; read?: HelperScreen; moved?: boolean } | { ok: false; message: string };
+
+export type Step = { ok: true; read?: HelperScreen; moved?: boolean } | { ok: false; message: string };
+
+/** Why a click or drag at coordinates didn't happen, for the model. */
+const POINTER_ERRORS: Record<Exclude<PointerOutcome, "done">, string> = {
+  gone: OUTCOME_ERRORS_GONE,
+  hidden: "The window is minimized or on another workspace: ask the person to bring it back, then try again.",
+  busy: "GNOME's overview or one of its dialogs is open; ask the person to close it, then try again.",
+  covered: "Another window covers that spot and Kiki couldn't bring this one to the front: ask the person to move the other window.",
+  cancelled: "The person stopped Kiki.",
+};
+
+/**
+ * A click or drag at coordinates in the window's last screenshot (`size` is that screenshot's), through the
+ * GNOME extension (v13), which brings the window to the front when something covers the spot. Returns an error
+ * for the model, or null.
+ */
+export async function pointerInWindow(
+  source: SourceWindow,
+  action: { click_at: { x: number; y: number; button?: "left" | "right" | "middle"; count?: number } } | { drag: { from: { x: number; y: number }; to: { x: number; y: number } } },
+  size: { width: number; height: number },
+): Promise<string | null> {
+  if (!source.wheel) return "Kiki's GNOME helper needs updating before it can click at coordinates (Settings → Update GNOME helper, then log out and back in).";
+  const fraction = (point: { x: number; y: number }) => ({ x: point.x / Math.max(1, size.width), y: point.y / Math.max(1, size.height) });
+  const outcome =
+    "click_at" in action
+      ? await clickAt(fraction(action.click_at).x, fraction(action.click_at).y, action.click_at.button ?? "left", action.click_at.count ?? 1)
+      : await dragPath([fraction(action.drag.from), fraction(action.drag.to)]);
+  if (outcome === null) return "Kiki's GNOME helper needs updating before it can click at coordinates (Settings → Update GNOME helper, then log out and back in).";
+  return outcome === "done" ? null : POINTER_ERRORS[outcome];
+}
+
+/** Presses one key (or shortcut) in the window, through the GNOME extension (v13). Returns an error, or null. */
+export async function keyInWindow(source: SourceWindow, key: string): Promise<string | null> {
+  if (!source.keys) return "Kiki's GNOME helper needs updating before it can press keys there (Settings → Update GNOME helper, then log out and back in).";
+  const done = await keyChord(key);
+  return done ? null : `Kiki couldn't press ${key} there: the window wouldn't take the keyboard, or the helper is older than v13.`;
+}
+
+/**
+ * Clicks a control in the window by its id, like `clickControl`, but only presses it and waits for what it
+ * opened, without the read: `act` reads once at the end. Returns an error for the model, or null.
+ */
+export async function clickInWindow(capture: Capture, state: ScreenState, controlId: string, options: { auto?: boolean } = {}): Promise<string | null> {
+  const source = capture.source;
+  if (!source?.pid) return "Kiki can't click anything in this window.";
+  const control = state.controls.get(controlId);
+  if (!control) return `${controlId || "That"} isn't one of the controls on screen: use the ids in the screen below.`;
+  const refusal = clickRefusal(control, options);
+  if (refusal) return refusal;
+  const read = await runHelper<HelperScreen>(
+    ["--click", JSON.stringify({ pid: source.pid, window: source.window, path: control.path, role: control.role, name: control.name })],
+    CLICK_TIMEOUT_MS,
+  ).catch((error: unknown): HelperScreen => ({ ok: false, error: String(error) }));
+  if (!read.ok) return `Kiki couldn't click ${control.id} (${control.name}): it ${PRESS_REASONS[read.reason ?? ""] ?? "didn't work"}.`;
+  if (read.navigated) leaveForm(capture);
+  return null;
+}
 
 /** Asks the helper to read the window's screen, or undefined when Kiki can't (or may not) read its text. */
-async function readScreen(source: SourceWindow, access: ScreenAccess): Promise<HelperScreen | undefined> {
+export async function readScreen(source: SourceWindow, access: ScreenAccess): Promise<HelperScreen | undefined> {
   if (!source.pid || !access.text) return undefined;
   const read = await runHelper<HelperScreen>(["--screen", JSON.stringify({ pid: source.pid, window: source.window })], 6_000).catch(
     (error: unknown): HelperScreen => ({ ok: false, error: String(error) }),
@@ -251,7 +447,7 @@ async function readScreen(source: SourceWindow, access: ScreenAccess): Promise<H
 }
 
 /** Scrolls a screen: with the GNOME extension's wheel, or over AT-SPI in a page. */
-async function scrollScreen(source: SourceWindow, direction: "down" | "up", access: ScreenAccess): Promise<Step> {
+export async function scrollScreen(source: SourceWindow, direction: "down" | "up", access: ScreenAccess): Promise<Step> {
   const sign = direction === "down" ? 1 : -1;
   if (source.wheel) {
     const known = source.toolkit === "gecko" || source.toolkit?.startsWith("gtk");
@@ -281,7 +477,7 @@ async function scrollScreen(source: SourceWindow, direction: "down" | "up", acce
  * Brings text Claude saw back into view: over AT-SPI, or with the wheel when the app doesn't scroll that way
  * (twice at most, as the wheel's distance is only about right).
  */
-async function scrollTo(source: SourceWindow, to: string, access: ScreenAccess): Promise<Step> {
+export async function scrollTo(source: SourceWindow, to: string, access: ScreenAccess): Promise<Step> {
   if (!source.pid) {
     return { ok: false, message: "Kiki can't find text in this window, only scroll it: scroll up or down by screens instead." };
   }
@@ -342,10 +538,15 @@ export async function runScreenTool(
     if (now === undefined || now !== state.last || step.moved) break;
     if (attempt === 0 && !signal?.aborted) await sleep(LOAD_MORE_MS);
   }
+  if (signal?.aborted) return fail("Cancelled.");
   const screenshot = access.screenshot && source.screenshot ? await source.screenshot().catch(() => undefined) : undefined;
-  const read = step.ok ? step.read : undefined;
+  let read = step.ok ? step.read : undefined;
   const now = signature(read, screenshot?.data);
   const atEnd = Boolean(request && "direction" in request && now !== undefined && now === state.last);
+  // What this screen shares with the last one (the overlap of a scroll by screens) is read once.
+  if (read?.text && request && "direction" in request && !atEnd && typeof state.last === "string") {
+    read = { ...read, text: dedupeScreen(state.last, read.text, request.direction).text };
+  }
   state.last = now;
   const note = request ? scrollNote(request, atEnd) : "This is what's on screen now.";
   return { id: call.id, ...screenResult(capture, source, state, read, screenshot, access, note, atEnd) };
@@ -355,7 +556,7 @@ export async function runScreenTool(
  * What Claude reads after a scroll, look or click: `note` (with a word on what it can't see), and the window's
  * title, page address, text (with ids on its controls) and form fields, with a screenshot when the camera is on.
  */
-function screenResult(
+export function screenResult(
   capture: Capture,
   source: SourceWindow,
   state: ScreenState,
@@ -405,6 +606,7 @@ export async function clickControl(
   call: { id: string; input: Record<string, unknown> },
   access: ScreenAccess,
   onClick?: (control: ControlTarget) => void,
+  options: { auto?: boolean } = {},
 ): Promise<{ result: ToolResult; done?: ClickDone }> {
   const fail = (content: string) => ({ result: { id: call.id, content, isError: true } });
   const source = capture.source;
@@ -412,7 +614,7 @@ export async function clickControl(
   const id = typeof call.input["control"] === "string" ? call.input["control"].trim() : "";
   const control = state.controls.get(id);
   if (!control) return fail(`${id || "That"} isn't one of the controls in <visible_text>: look or scroll first, and use the ids there.`);
-  const refusal = clickRefusal(control);
+  const refusal = clickRefusal(control, options);
   if (refusal) return fail(refusal);
   onClick?.(control);
   const read = await runHelper<HelperScreen>(
@@ -442,7 +644,7 @@ function scrollNote(request: ScrollRequest, atEnd: boolean): string {
   return `Scrolled ${request.direction} a screen.`;
 }
 
-/** A scroll's input as the server checked it, or null. */
+/** A scroll's input as the engine checked it, or null. */
 function scrollRequest(input: Record<string, unknown>): ScrollRequest | null {
   if (typeof input["to"] === "string" && input["to"].trim()) return { to: input["to"].trim().slice(0, LIMITS.scrollToChars) };
   const direction = input["direction"];

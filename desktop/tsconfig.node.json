@@ -5,5 +5,5 @@
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true
   },
-  "include": ["electron.vite.config.ts", "src/main", "src/preload", "src/shared-types.ts", "src/env.d.ts", "test"]
+  "include": ["electron.vite.config.ts", "src/main", "src/preload", "src/shared-types.ts", "src/services.ts", "src/env.d.ts", "test"]
 }

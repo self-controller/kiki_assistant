@@ -106,3 +106,72 @@ footer #saveStatus {
   flex: 1;
   text-align: right;
 }
+
+fieldset.provider {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+fieldset.provider + fieldset.provider {
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+/* Inside the fieldset, above its options, rather than on its top border. */
+legend {
+  float: left;
+  width: 100%;
+  padding: 0;
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+
+legend + * {
+  clear: both;
+}
+
+.indent {
+  padding-left: 24px;
+}
+
+.model-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.model-list:empty {
+  display: none;
+}
+
+.model-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.model-list .model-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+details summary {
+  cursor: pointer;
+  font-weight: 500;
+}
+
+details[open] {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}

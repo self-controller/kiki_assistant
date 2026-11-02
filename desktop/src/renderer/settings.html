@@ -17,20 +17,115 @@
       </header>
 
       <section>
-        <h2>Connection</h2>
-        <label>
-          <span>Server address</span>
-          <input id="serverUrl" type="url" placeholder="https://kiki.example.com" required />
-        </label>
-        <label>
-          <span>Access code</span>
-          <input id="accessCode" type="password" autocomplete="off" spellcheck="false" placeholder="kiki_…" />
-        </label>
+        <h2>Models</h2>
+        <p class="hint">
+          Kiki asks models straight from this computer, on your own accounts: your Claude or ChatGPT plan through
+          Claude Code or Codex, your API keys, or models running here. Pick one in the popup's model menu.
+        </p>
+
+        <fieldset class="provider">
+          <legend>Claude</legend>
+          <label class="check">
+            <input type="radio" name="anthropicAccount" value="agent" />
+            <span>Claude Code on this computer, with your Claude plan</span>
+          </label>
+          <p id="anthropicAgentStatus" class="hint indent"></p>
+          <label class="check">
+            <input type="radio" name="anthropicAccount" value="key" />
+            <span>Anthropic API key</span>
+          </label>
+          <input id="anthropicKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…" aria-label="Anthropic API key" />
+          <div class="row">
+            <button id="removeAnthropicKey" type="button" hidden>Remove</button>
+            <span id="anthropicKeyStatus" class="hint" role="status"></span>
+          </div>
+        </fieldset>
+
+        <fieldset class="provider">
+          <legend>GPT</legend>
+          <label class="check">
+            <input type="radio" name="openaiAccount" value="agent" />
+            <span>Codex on this computer, with your ChatGPT plan</span>
+          </label>
+          <p id="openaiAgentStatus" class="hint indent"></p>
+          <label class="check">
+            <input type="radio" name="openaiAccount" value="key" />
+            <span>OpenAI API key</span>
+          </label>
+          <input id="openaiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…" aria-label="OpenAI API key" />
+          <div class="row">
+            <button id="removeOpenaiKey" type="button" hidden>Remove</button>
+            <span id="openaiKeyStatus" class="hint" role="status"></span>
+          </div>
+        </fieldset>
+
+        <fieldset class="provider">
+          <legend>Gemini</legend>
+          <input id="geminiKey" type="password" autocomplete="off" spellcheck="false" placeholder="AIza…" aria-label="Gemini API key" />
+          <div class="row">
+            <button id="removeGeminiKey" type="button" hidden>Remove</button>
+            <span id="geminiKeyStatus" class="hint" role="status"></span>
+          </div>
+        </fieldset>
+
         <div class="row">
-          <button id="test" type="button">Save and test connection</button>
-          <span id="testResult" class="hint" role="status"></span>
+          <button id="checkAgents" type="button">Check Claude Code and Codex again</button>
+          <span id="agentsStatus" class="hint" role="status"></span>
         </div>
+        <p class="hint">
+          Install <a href="https://code.claude.com/docs/en/setup" target="_blank" rel="noreferrer">Claude Code</a> or
+          <a href="https://developers.openai.com/codex/cli" target="_blank" rel="noreferrer">Codex</a> and sign in
+          there (<code>claude</code>, then log in; <code>codex login</code>): Kiki uses your sign-in and never sees
+          it. Or get a key from
+          <a href="https://platform.claude.com/settings/keys" target="_blank" rel="noreferrer">Anthropic</a>,
+          <a href="https://platform.openai.com/api-keys" target="_blank" rel="noreferrer">OpenAI</a> or
+          <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer">Google AI Studio</a>. Keys stay
+          on this computer and go only to their own provider, with your questions.
+        </p>
         <p id="storageWarning" class="warn" hidden></p>
+      </section>
+
+      <section>
+        <h2>Other services and local models</h2>
+        <p class="hint">
+          Models from OpenRouter, Groq, DeepSeek, xAI, Mistral, Together or any OpenAI-compatible address, on your
+          key, or running on this computer with Ollama or LM Studio. They're under <b>Other</b> in the popup's model
+          menu. They can't search the web.
+        </p>
+        <ul id="customModels" class="model-list"></ul>
+        <details id="addModel">
+          <summary>Add a model</summary>
+          <label>
+            <span>Service</span>
+            <select id="newService"></select>
+          </label>
+          <label id="newUrlRow">
+            <span>Address</span>
+            <input id="newUrl" type="url" spellcheck="false" placeholder="https://…/v1" />
+          </label>
+          <label id="newKeyRow">
+            <span>API key</span>
+            <input id="newKey" type="password" autocomplete="off" spellcheck="false" />
+          </label>
+          <div class="row">
+            <button id="loadModels" type="button">Load models</button>
+            <span id="loadStatus" class="hint" role="status"></span>
+          </div>
+          <label>
+            <span>Model</span>
+            <input id="newModel" type="text" spellcheck="false" list="modelOptions" placeholder="e.g. qwen3:8b" />
+            <datalist id="modelOptions"></datalist>
+          </label>
+          <label>
+            <span>Name in the menu</span>
+            <input id="newName" type="text" maxlength="40" placeholder="The model's name" />
+          </label>
+          <div class="row">
+            <button id="addModelButton" type="button">Add model</button>
+            <span id="addStatus" class="hint" role="status"></span>
+          </div>
+          <p id="keyHint" class="hint"></p>
+        </details>
       </section>
 
       <section>
@@ -67,6 +162,13 @@
 
       <section>
         <h2>Context</h2>
+        <label id="nearbyTextRow">
+          <span>Nearby text</span>
+          <select id="nearbyText">
+            <option value="always">Send the text around what I highlight</option>
+            <option value="never">Never: only what I highlight</option>
+          </select>
+        </label>
         <label>
           <span>Screenshot</span>
           <select id="screenshot">
@@ -76,6 +178,42 @@
           </select>
         </label>
         <p class="hint">Before you send a question, the popup shows what will be shared, and you can remove any of it.</p>
+      </section>
+
+      <section>
+        <h2>Computer control</h2>
+        <label class="check">
+          <input id="cuBrowser" type="checkbox" />
+          <span>Browse the web in Kiki's own browser</span>
+        </label>
+        <p class="hint">
+          Kiki opens pages in a hidden browser of its own (not yours) to read them and work on them. It shows the
+          browser only when you ask to see the page, or when you need to do something there yourself, like log in.
+        </p>
+        <label class="check" id="cuWindowsRow">
+          <input id="cuWindows" type="checkbox" />
+          <span>Work in other windows and start apps</span>
+        </label>
+        <label class="check" id="cuCoordinatesRow">
+          <input id="cuCoordinates" type="checkbox" />
+          <span>Click by screenshot where accessibility has nothing to click</span>
+        </label>
+        <p class="hint">
+          Whenever Kiki clicks, types, scrolls or pastes in your windows, a banner at the top of the screen says
+          so; press its Stop button or Esc to stop it. Anything that sends, buys, deletes or changes something
+          waits for you on a card, unless you turn that off below.
+        </p>
+        <label class="check">
+          <input id="cuAutoApprove" type="checkbox" />
+          <span>Act without asking</span>
+        </label>
+        <p class="hint">
+          Kiki clicks any button or link you ask for (likes, follows, sends, deletes included) and writes into
+          your apps and forms right away: edit, changes, fill and press cards are applied as soon as Kiki
+          proposes them, and show as done, with Undo where there is one. Passwords, card and ID numbers,
+          payments, and calendar, task and email cards still wait for you. A page can't ask Kiki to do things,
+          but a model can misread one: keep this off unless you watch Kiki work, and use Esc or Stop to halt it.
+        </p>
 
         <div id="linuxA11y" hidden>
           <div class="row">
@@ -109,7 +247,7 @@
         <p class="hint">
           Lets Kiki add events to Google Calendar, add tasks, save Gmail drafts and send emails, each only after you
           approve its card, and check your calendar and tasks when you ask. Kiki never reads your email. Your
-          Google sign-in stays on this computer and never goes to the Kiki server.
+          Google sign-in stays on this computer.
         </p>
       </section>
 
@@ -134,7 +272,7 @@
             placeholder="Describe how Kiki should talk, e.g. “Answer like a patient tutor, with one example.”"
           ></textarea>
         </label>
-        <p class="hint">Applies to new conversations. Your prompt is sent to your Kiki server with each one.</p>
+        <p class="hint">Applies to new conversations. Your prompt goes to the model with each question.</p>
       </section>
 
       <section>

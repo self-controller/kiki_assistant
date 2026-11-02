@@ -1,19 +1,26 @@
 import "@fontsource-variable/geist";
 import "@fontsource-variable/geist-mono";
+import "katex/dist/katex.min.css";
 import {
+  CUSTOM_MODEL_PATTERN,
   EFFORT_LEVELS,
+  isCustomModel,
   LIMITS,
   MODEL_CHOICES,
+  MODEL_PROVIDERS,
+  PROVIDERS,
+  type AttachedFile,
   type EffortLevel,
   type FormField,
   type ModelChoice,
+  type ModelPick,
+  type Provider,
+  type QuestionOptions,
   type Screenshot,
-  type Source,
 } from "@kiki/shared";
-import DOMPurify from "dompurify";
-import { marked } from "marked";
 import type {
   ContextOmissions,
+  CustomModelInfo,
   EditInfo,
   HistoryItem,
   PastSession,
@@ -21,18 +28,20 @@ import type {
   PopupEvent,
   PopupInit,
   PopupLayout,
+  ProviderStatus,
   SavedAction,
+  WindowContext,
   WindowRect,
 } from "../shared-types.ts";
 import { renderActionCard, type CardOptions } from "./actionCard.ts";
-import { hostOf, plural } from "./feed.ts";
+import { Answer, copyCode, renderMarkdown, sourceList, type AnswerHost } from "./answer.ts";
+import { clip, el, keepFocus } from "./dom.ts";
+import { plural } from "./feed.ts";
 import { renderHistory } from "./history.ts";
 import { icon, setIcon, type IconName } from "./icons.ts";
 import { cardBottomIn, INSETS, springStep, type Spring } from "./layout.ts";
-import { FADE_MS, freshRanges, revealTo, type FreshRange, type Reveal } from "./reveal.ts";
+import { MAX_FILE_BYTES, readTextFile } from "./textFile.ts";
 import { morphText } from "./textfx.ts";
-import { Trace } from "./trace.ts";
-import "./styles.css";
 import "./popup.css";
 
 const kiki = window.kiki.popup;
@@ -49,6 +58,9 @@ const composer = $<HTMLFormElement>("composer");
 const context = $<HTMLDivElement>("context");
 const chips = $<HTMLDivElement>("chips");
 const notes = $<HTMLParagraphElement>("notes");
+const helperNote = $<HTMLParagraphElement>("helperNote");
+const helperNoteText = $<HTMLSpanElement>("helperNoteText");
+const helperOn = $<HTMLButtonElement>("helperOn");
 const attachmentsRow = $<HTMLDivElement>("attachments");
 const input = $<HTMLTextAreaElement>("input");
 const modelButton = $<HTMLButtonElement>("model");
@@ -60,6 +72,10 @@ const fileInput = $<HTMLInputElement>("file");
 const sendButton = $<HTMLButtonElement>("send");
 const modelMenu = $<HTMLDivElement>("modelMenu");
 const modelItems = $<HTMLDivElement>("modelItems");
+const providerTabs = $<HTMLDivElement>("providerTabs");
+const providerHint = $<HTMLDivElement>("providerHint");
+const providerHintText = $<HTMLParagraphElement>("providerHintText");
+const providerSettings = $<HTMLButtonElement>("providerSettings");
 
 const MAX_IMAGE_EDGE = 1568;
 const MAX_INPUT_HEIGHT = 160;
@@ -67,6 +83,8 @@ const MAX_INPUT_HEIGHT = 160;
 const omit: ContextOmissions = {};
 let started = false;
 let busy = false;
+/** Cards whose buttons are running (a paste, an undo): the composer's button is Stop meanwhile. */
+let cardsRunning = 0;
 let current: Answer | null = null;
 /** A Google account is connected, so cards act directly instead of opening Google in the browser. */
 let googleConnected = false;
@@ -75,13 +93,8 @@ let editTarget: EditInfo | undefined;
 /** The form fields fill cards set, in that same window. */
 let formFields: FormField[] | undefined;
 let attachments: Array<Screenshot & { preview: string; id: number }> = [];
+let fileAttachments: Array<AttachedFile & { id: number }> = [];
 
-function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, text?: string) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
 
 function formatChars(count: number): string {
   return count >= 1000 ? `${Math.round(count / 1000)}k chars` : `${count} chars`;
@@ -103,9 +116,15 @@ let sizeFrame = 0;
 let lastSizeFrame = 0;
 
 /** The chat box's natural height: the composer plus the whole conversation (or the past sessions). */
+/** The chat box's top and bottom borders together; they don't change. */
+let cardBorders: number | undefined;
+
 function naturalHeight(): number {
-  const style = getComputedStyle(card);
-  const chrome = parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth);
+  if (cardBorders === undefined) {
+    const style = getComputedStyle(card);
+    cardBorders = parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth);
+  }
+  const chrome = cardBorders;
   const conversation = historyOpen
     ? historyView.offsetHeight
     : threadContent.childElementCount > 0
@@ -135,6 +154,7 @@ async function show(cardHeight: number): Promise<void> {
     maxCard: height - INSETS.top - INSETS.bottom,
   };
   popup.classList.toggle("shell-move", Boolean(place.shellMove));
+  helperNote.hidden = !place.helperOff;
   target = Math.min(naturalHeight(), place.maxCard);
   box = { value: target, velocity: 0 };
   placeBox(target);
@@ -190,7 +210,9 @@ function reportHitRect(): void {
   if (!place?.staysOpen || hitFrame) return;
   hitFrame = requestAnimationFrame(() => {
     hitFrame = 0;
-    const rects = [card, mascot, closeButton].map((node) => node.getBoundingClientRect());
+    // The model menu opens upward, and can reach above Kiki when the box is short.
+    const nodes = modelMenu.classList.contains("open") ? [card, mascot, closeButton, modelMenu] : [card, mascot, closeButton];
+    const rects = nodes.map((node) => node.getBoundingClientRect());
     const slop = 2;
     const left = Math.floor(Math.min(...rects.map((r) => r.left)) - slop);
     const top = Math.floor(Math.min(...rects.map((r) => r.top)) - slop);
@@ -211,8 +233,10 @@ function reportHitRect(): void {
   });
 }
 
-// The box scales in as it first shows.
-popup.addEventListener("transitionend", () => reportHitRect());
+// The box scales in as it first shows (its parts' own transitions, say a hover, don't move it).
+popup.addEventListener("transitionend", (event) => {
+  if (event.target === popup) reportHitRect();
+});
 
 new ResizeObserver(() => layout()).observe(threadContent);
 new ResizeObserver(() => layout()).observe(historyView);
@@ -250,11 +274,14 @@ let onDragRegion = false;
 /** The compositor is moving the window; its grab takes focus away, which isn't a reason to close. */
 let moving = false;
 
+/** The parts of the box that move the window. */
+const dragRegions = [".grip", ".actions"].map((selector) => card.querySelector(selector));
+
 function nearDragRegion(event: PointerEvent): boolean {
   if ((event.target as Element | null)?.closest?.(INTERACTIVE)) return false;
   const slop = 4;
-  return [".grip", ".actions"].some((selector) => {
-    const rect = card.querySelector(selector)?.getBoundingClientRect();
+  return dragRegions.some((region) => {
+    const rect = region?.getBoundingClientRect();
     return (
       rect !== undefined &&
       event.clientX >= rect.left - slop &&
@@ -271,7 +298,8 @@ let pointerOver = true;
 document.addEventListener("pointermove", (event) => {
   // Moves reach the page again once the compositor lets go of the window.
   moving = false;
-  onDragRegion = nearDragRegion(event);
+  // Only the blur handler asks, and only without click-through.
+  if (!place?.staysOpen) onDragRegion = nearDragRegion(event);
   if (place?.staysOpen && hitRect) {
     const inside =
       event.clientX >= hitRect.x &&
@@ -318,7 +346,10 @@ window.addEventListener("focus", () => {
 
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
-  if (modelMenu.classList.contains("open")) {
+  if (cardsRunning > 0) {
+    // A card's button is still running (pasting, undoing): Esc stops it, like Stop.
+    kiki.cancel();
+  } else if (modelMenu.classList.contains("open")) {
     setModelMenu(false);
     input.focus();
   } else if (historyOpen) {
@@ -342,57 +373,6 @@ function scrollToBottom(force = false): void {
   if (force || nearBottom()) thread.scrollTop = thread.scrollHeight;
 }
 
-/**
- * Wraps the text in `ranges` (counted like `root.textContent`) in spans that fade in, partway through
- * their fade. Plain inline spans, so the text is laid out the same with or without them.
- */
-function wrapFresh(root: HTMLElement, ranges: FreshRange[]): void {
-  if (ranges.length === 0) return;
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-  const nodes: Text[] = [];
-  while (walker.nextNode()) nodes.push(walker.currentNode as Text);
-
-  let offset = 0;
-  for (const node of nodes) {
-    const start = offset;
-    const end = (offset += node.data.length);
-    // Whitespace between blocks (say, "\n" between list items) has nothing to animate.
-    if (end <= ranges[0]!.start || !node.data.trim()) continue;
-    const fragment = document.createDocumentFragment();
-    let at = start;
-    for (const range of ranges) {
-      if (range.end <= at || range.start >= end) continue;
-      if (range.start > at) fragment.append(node.data.slice(at - start, range.start - start));
-      const from = Math.max(range.start, at);
-      const until = Math.min(range.end, end);
-      // Rebuilt every frame: each run picks up its fade where it was.
-      const fresh = el("span", "fresh", node.data.slice(from - start, until - start));
-      fresh.style.setProperty("--d", `${-Math.round(range.age)}ms`);
-      fragment.append(fresh);
-      at = until;
-    }
-    if (at === start) continue;
-    if (at < end) fragment.append(node.data.slice(at - start));
-    node.replaceWith(fragment);
-  }
-}
-
-function renderMarkdown(markdown: string): string {
-  return DOMPurify.sanitize(marked.parse(markdown, { async: false, gfm: true }));
-}
-
-/** The links an answer cites, by site. */
-function sourceList(items: Source[]): HTMLElement {
-  const list = el("div", "sources");
-  for (const item of items) {
-    const link = el("a", undefined, hostOf(item.url));
-    link.href = item.url;
-    link.title = item.title;
-    list.append(link);
-  }
-  return list;
-}
-
 const cardOptions: CardOptions = {
   get google() {
     return googleConnected;
@@ -404,151 +384,38 @@ const cardOptions: CardOptions = {
     return formFields;
   },
   run: async (id, edited, mode) => {
-    const result = await kiki.runAction(id, edited, mode);
-    // An edit moves the target onto Kiki's text, for the next card.
-    if (result.ok && result.edit !== undefined) editTarget = result.edit ?? undefined;
-    return result;
+    // Stop cancels a card that's running, like an answer.
+    if (mode !== "dismiss") setCardBusy(true);
+    try {
+      const result = await kiki.runAction(id, edited, mode);
+      // An edit moves the target onto Kiki's text, for the next card (and back onto the original after an undo).
+      if (result.ok && result.edit !== undefined) editTarget = result.edit ?? undefined;
+      return result;
+    } finally {
+      if (mode !== "dismiss") setCardBusy(false);
+    }
   },
   openSettings: () => kiki.openSettings(),
   onChange: () => layout(),
 };
 
-function actionCard(saved: SavedAction): HTMLElement {
-  return renderActionCard(saved, cardOptions);
-}
+/** What answers need of the thread. */
+const answerHost: AnswerHost = {
+  content: threadContent,
+  nearBottom,
+  scrollToBottom,
+  card: (saved) => renderActionCard(saved, cardOptions),
+};
 
-/** One assistant reply: the thinking feed, streamed markdown that fades in, then sources. */
-class Answer {
-  readonly root = el("div", "msg assistant");
-  readonly trace = new Trace(() => scrollToBottom());
-  readonly body = el("div", "answer");
-  /** Action cards Kiki proposed, below the text. */
-  readonly cards = el("div", "action-cards");
-  /** The markdown received so far; the first `#shown` characters of it are on screen. */
-  raw = "";
-  #shown = 0;
-  finished = false;
-  /** Runs of the rendered text that are still animating in, and the rendered text's length. */
-  #reveals: Reveal[] = [];
-  #length = 0;
-  /** Sources and notes, added below the text once all of it is on screen. */
-  #after: Array<() => void> = [];
-  #frame = 0;
-  #lastFrame = 0;
-  #settleTimer = 0;
-
-  constructor() {
-    this.root.append(this.trace.root, this.body, this.cards);
-    threadContent.append(this.root);
-    scrollToBottom(true);
-  }
-
-  /** The answer has started: fold the thinking feed, or drop it if there was nothing to show. */
-  settleTrace(): void {
-    if (this.trace.finished) return;
-    this.trace.finish();
-    // A quick answer with nothing to show besides the header: drop the feed.
-    if (!this.trace.hasContent) this.trace.root.remove();
-  }
-
-  append(delta: string): void {
-    this.raw += delta;
-    this.settleTrace();
-    this.#run();
-  }
-
-  #run(): void {
-    if (!this.#frame) this.#frame = requestAnimationFrame((now) => this.#step(now));
-  }
-
-  /** One frame: shows a few more words, at a pace that keeps up with the stream. */
-  #step(now: number): void {
-    this.#frame = 0;
-    const dt = this.#lastFrame ? Math.min(now - this.#lastFrame, 50) : 16;
-    const next = reduceMotion.matches ? this.raw.length : revealTo(this.raw, this.#shown, dt);
-    if (next !== this.#shown) {
-      this.#shown = next;
-      this.#render(now);
-    }
-    if (this.#shown < this.raw.length) {
-      this.#lastFrame = now;
-      this.#run();
-    } else {
-      this.#lastFrame = 0;
-      if (this.finished) for (const add of this.#after.splice(0)) add();
-      this.#settle();
-    }
-  }
-
-  /** Once the last run has faded in, renders the text once more as plain text. */
-  #settle(): void {
-    window.clearTimeout(this.#settleTimer);
-    const last = this.#reveals.at(-1);
-    if (!last) return;
-    this.#settleTimer = window.setTimeout(
-      () => {
-        // More text came in meanwhile; its last frame settles again.
-        if (!this.#frame) this.#render(performance.now());
-      },
-      Math.max(0, last.time + FADE_MS - performance.now()),
-    );
-  }
-
-  #render(now: number): void {
-    const stick = nearBottom();
-    this.body.innerHTML = renderMarkdown(this.raw.slice(0, this.#shown));
-    const length = this.body.textContent?.length ?? 0;
-    // Markdown can reread earlier text as more arrives (a closing ** turns literal stars into bold).
-    if (length < this.#length) this.#reveals = this.#reveals.filter((reveal) => reveal.start < length);
-    else if (length > this.#length) this.#reveals.push({ start: this.#length, time: now });
-    this.#length = length;
-    this.#reveals = this.#reveals.filter((reveal) => now - reveal.time < FADE_MS);
-    wrapFresh(this.body, freshRanges(this.#reveals, length, now));
-    if (stick) scrollToBottom(true);
-  }
-
-  /** Adds `add` below the answer once the stream has finished and all its text is on screen. */
-  #afterText(add: () => void): void {
-    this.#after.push(add);
-    this.#run();
-  }
-
-  /** The last `chars` of the text were Kiki's notes on the way to a lookup or card: they go in the feed. */
-  retract(chars: number): void {
-    const keep = Math.max(0, this.raw.length - chars);
-    const moved = this.raw.slice(keep).trim();
-    this.raw = this.raw.slice(0, keep);
-    this.#shown = Math.min(this.#shown, keep);
-    this.#reveals = [];
-    this.#render(performance.now());
-    if (!this.trace.root.isConnected) this.root.prepend(this.trace.root);
-    this.trace.resume();
-    if (moved) this.trace.addThinking(`\n\n${moved}`);
-  }
-
-  addCard(saved: SavedAction): void {
-    this.settleTrace();
-    this.cards.append(actionCard(saved));
-    scrollToBottom();
-  }
-
-  sources(items: Source[]): void {
-    this.#afterText(() => {
-      this.root.append(sourceList(items));
-      scrollToBottom();
-    });
-  }
-
-  /** The stream has ended; the text still being shown finishes at its own pace. */
-  finish(note?: string): void {
-    if (this.finished) return;
-    this.finished = true;
-    this.settleTrace();
-    if (note) this.#afterText(() => this.root.append(el("div", "cutoff", note)));
-    if (!this.raw && !note && !this.cards.hasChildNodes()) this.root.remove();
-    this.#run();
-  }
-}
+// Kiki's GNOME extension was switched off: turning it on places the next popup at the pointer again.
+helperOn.addEventListener("click", async () => {
+  helperOn.disabled = true;
+  const result = await kiki.enableExtension();
+  helperNoteText.textContent = result.message ?? "Turned on.";
+  if (result.ok) helperOn.remove();
+  else helperOn.disabled = false;
+  layout();
+});
 
 function showError(message: string, code?: string): void {
   const box = el("div", "msg error", message);
@@ -592,6 +459,11 @@ function handleEvent(event: PopupEvent): void {
     case "action":
       answer?.addCard({ action: event.action });
       break;
+    case "card":
+      // Applied right away ("Act without asking"): the card arrives done.
+      answer?.addCard(event.saved);
+      if (event.edit !== undefined) editTarget = event.edit ?? undefined;
+      break;
     case "notes":
       if (answer && !answer.finished) answer.retract(event.chars);
       break;
@@ -610,10 +482,23 @@ function handleEvent(event: PopupEvent): void {
       endTurn();
       break;
     case "context":
+      // For a highlight the hotkey brought in: only while it waits for the next question.
+      if (event.selection !== undefined) {
+        if (!pending) break;
+        setHighlightChip(event.selection);
+        if (!pending.withWindow) break;
+      }
       setTextChip(event.textChars, event.textPreview);
       break;
     case "fields":
-      formFields = event.fields;
+      if (event.next && pending) pending.fields = event.fields;
+      else formFields = event.fields;
+      break;
+    case "target":
+      setTargetChip(event.kind, event.label);
+      break;
+    case "recapture":
+      takeCapture(event);
       break;
   }
 }
@@ -627,10 +512,24 @@ function endTurn(): void {
   input.focus();
 }
 
+/** Kiki is answering, or a card's button is running: the composer's button is Stop meanwhile. */
+function working(): boolean {
+  return busy || cardsRunning > 0;
+}
+
+function syncBusy(): void {
+  popup.classList.toggle("busy", working());
+  updateSend();
+}
+
 function setBusy(next: boolean): void {
   busy = next;
-  popup.classList.toggle("busy", next);
-  updateSend();
+  syncBusy();
+}
+
+function setCardBusy(running: boolean): void {
+  cardsRunning = Math.max(0, cardsRunning + (running ? 1 : -1));
+  syncBusy();
 }
 
 // ---------- Model, effort and search ----------
@@ -639,7 +538,29 @@ const MODELS: Record<ModelChoice, { label: string; icon: IconName }> = {
   haiku: { label: "Haiku", icon: "zap" },
   sonnet: { label: "Sonnet", icon: "sparkle" },
   opus: { label: "Opus", icon: "gem" },
+  "flash-lite": { label: "Flash-Lite", icon: "zap" },
+  flash: { label: "Flash", icon: "sparkle" },
+  argon: { label: "Argon", icon: "gem" },
+  luna: { label: "Luna", icon: "zap" },
+  sol: { label: "Sol", icon: "sparkle" },
+  astra: { label: "Astra", icon: "gem" },
 };
+
+/** The model menu's tabs: each provider's models, then the ones the person added ("Other"). */
+type MenuTab = Provider | "custom";
+const MENU_TABS: readonly MenuTab[] = [...PROVIDERS, "custom"];
+
+/** Each tab's name, the family its models belong to, and what to set up in Settings before they can answer. */
+const TAB_INFO: Record<MenuTab, { tab: string; family: string; setup: string }> = {
+  anthropic: { tab: "Anthropic", family: "Claude", setup: "To ask Claude, set up Claude Code or add an Anthropic API key in Settings." },
+  google: { tab: "Google", family: "Gemini", setup: "To ask Gemini, add your Gemini API key in Settings." },
+  openai: { tab: "OpenAI", family: "GPT", setup: "To ask GPT, set up Codex or add an OpenAI API key in Settings." },
+  custom: { tab: "Other", family: "", setup: "Add models from other services, or ones on this computer, in Settings." },
+};
+
+function tabOf(choice: ModelPick): MenuTab {
+  return isCustomModel(choice) ? "custom" : MODEL_PROVIDERS[choice];
+}
 
 const EFFORTS: Record<EffortLevel, string> = { low: "Low", medium: "Medium", high: "High", xhigh: "XHigh" };
 
@@ -661,7 +582,24 @@ function remember(key: string, value: string): void {
   }
 }
 
-let model: ModelChoice = remembered("kiki.model", MODEL_CHOICES, "opus");
+/** A model picked in an earlier popup: a built-in one, or one the person added (checked once init lists them). */
+function rememberedModel(key: string): ModelPick | null {
+  try {
+    const value = localStorage.getItem(key);
+    if (MODEL_CHOICES.includes(value as ModelChoice)) return value as ModelChoice;
+    return value && CUSTOM_MODEL_PATTERN.test(value) ? (value as ModelPick) : null;
+  } catch {
+    return null;
+  }
+}
+
+let model: ModelPick = rememberedModel("kiki.model") ?? "opus";
+/** Which tabs the menu offers and whether they're set up, from the popup's init. Until then, only Anthropic. */
+let tabStatus: Partial<Record<MenuTab, ProviderStatus>> = { anthropic: "ready" };
+/** The models the person added, from the popup's init. */
+let customModels: CustomModelInfo[] = [];
+/** The tab whose models the menu lists. */
+let menuTab: MenuTab = tabOf(model);
 let effort: EffortLevel = remembered("kiki.effort", EFFORT_LEVELS, "low");
 
 const modelIcon = modelButton.querySelector<HTMLElement>(".pill-icon")!;
@@ -691,16 +629,47 @@ const barNodes = [3.5, 6, 8.5, 11].map((height, index) => {
 });
 effortButton.querySelector(".pill-icon")!.append(bars);
 
-function setModel(choice: ModelChoice): void {
+/** A model's label and icon in the menu: a cloud or a chip for the ones the person added. */
+function modelInfo(choice: ModelPick): { label: string; icon: IconName; spoken: string } {
+  if (!isCustomModel(choice)) {
+    const { label, icon: name } = MODELS[choice];
+    return { label, icon: name, spoken: `${TAB_INFO[MODEL_PROVIDERS[choice]].family} ${label}` };
+  }
+  const added = customModels.find((info) => info.choice === choice);
+  return {
+    label: added?.name ?? "Model",
+    icon: added?.local ? "cpu" : "cloud",
+    spoken: added ? `${added.name} on ${added.service}` : "a model you added",
+  };
+}
+
+/** Picks the model. `keep` false: only for this popup (a stand-in while the chosen one can't be asked). */
+function setModel(choice: ModelPick, keep = true): void {
   model = choice;
-  remember("kiki.model", choice);
-  setIcon(modelIcon, MODELS[choice].icon, 14);
-  morphText(modelLabel, MODELS[choice].label);
-  modelButton.setAttribute("aria-label", `Model: ${MODELS[choice].label}`);
+  if (keep) {
+    remember("kiki.model", choice);
+    remember(`kiki.model.${tabOf(choice)}`, choice);
+  }
+  const info = modelInfo(choice);
+  setIcon(modelIcon, info.icon, 14);
+  morphText(modelLabel, info.label);
+  modelButton.setAttribute("aria-label", `Model: ${info.spoken}`);
   modelButton.title = "Choose the model";
   for (const item of modelItems.querySelectorAll<HTMLElement>(".menu-item")) {
     item.setAttribute("aria-checked", String(item.dataset["model"] === choice));
   }
+  syncCapabilities();
+}
+
+/** Models the person added can't search the web, and take no effort level: those buttons sit out. */
+function syncCapabilities(): void {
+  const custom = isCustomModel(model);
+  for (const button of [searchToggle, effortButton]) {
+    button.classList.toggle("unavailable", custom);
+    button.setAttribute("aria-disabled", String(custom));
+  }
+  searchToggle.title = custom ? "This model can't search the web" : "Search the web";
+  effortButton.title = custom ? "This model thinks as it's set up to" : "How hard Kiki thinks (click to change)";
 }
 
 function setEffort(level: EffortLevel): void {
@@ -731,34 +700,137 @@ function hideHighlight(): void {
 }
 
 function setModelMenu(open: boolean): void {
+  // It opens on the current model's tab.
+  if (open) showTab(tabOf(model));
   modelMenu.classList.toggle("open", open);
   modelButton.setAttribute("aria-expanded", String(open));
   if (!open) hideHighlight();
+  reportHitRect();
 }
 
-MODEL_CHOICES.forEach((choice, index) => {
+function menuItem(choice: ModelPick): HTMLElement {
   const item = el("button", "menu-item");
   item.type = "button";
   item.dataset["model"] = choice;
+  item.dataset["tab"] = tabOf(choice);
   item.setAttribute("role", "menuitemradio");
+  item.hidden = tabOf(choice) !== menuTab;
   const check = icon("check", 13, 2.5);
   check.classList.add("check");
-  item.append(icon(MODELS[choice].icon, 14), el("span", undefined, MODELS[choice].label), check);
-  item.addEventListener("pointerenter", () => moveHighlight(index));
-  item.addEventListener("focus", () => moveHighlight(index));
-  item.addEventListener("mousedown", (event) => event.preventDefault());
+  const info = modelInfo(choice);
+  const label = el("span", undefined, info.label);
+  if (isCustomModel(choice)) label.title = info.spoken;
+  item.append(icon(info.icon, 14), label, check);
+  item.addEventListener("pointerenter", () => moveHighlight(visibleItems().indexOf(item)));
+  item.addEventListener("focus", () => moveHighlight(visibleItems().indexOf(item)));
+  keepFocus(item);
   item.addEventListener("click", () => {
     setModel(choice);
     setModelMenu(false);
     input.focus();
   });
   modelItems.append(item);
+  return item;
+}
+
+/** The built-in models' items, then the ones for the models the person added. */
+let modelItemNodes = MODEL_CHOICES.map(menuItem);
+
+/** The menu's models for the tab it shows. */
+function visibleItems(): HTMLElement[] {
+  return modelItemNodes.filter((item) => !item.hidden);
+}
+
+const tabNodes = MENU_TABS.map((menu) => {
+  const tab = el("button", "provider-tab", TAB_INFO[menu].tab);
+  tab.type = "button";
+  tab.dataset["tab"] = menu;
+  keepFocus(tab);
+  tab.addEventListener("click", () => showTab(menu));
+  providerTabs.append(tab);
+  return tab;
 });
+
+/** The tabs the menu shows: every provider, and Other when the person added models. */
+function visibleTabs(): HTMLElement[] {
+  return tabNodes.filter((tab) => !tab.hidden);
+}
+
+/** Lists `menu`'s models, or, when they aren't set up, what to set up in Settings. */
+function showTab(menu: MenuTab): void {
+  menuTab = menu;
+  const ready = tabStatus[menu] === "ready";
+  for (const tab of tabNodes) {
+    const status = tabStatus[tab.dataset["tab"] as MenuTab];
+    tab.hidden = !status;
+    tab.classList.toggle("needs-key", status === "needsSetup");
+    tab.setAttribute("aria-pressed", String(tab.dataset["tab"] === menu));
+  }
+  providerTabs.hidden = visibleTabs().length < 2;
+  for (const item of modelItemNodes) item.hidden = item.dataset["tab"] !== menu;
+  modelItems.hidden = !ready;
+  providerHint.hidden = ready;
+  if (!ready) providerHintText.textContent = TAB_INFO[menu].setup;
+  hideHighlight();
+  reportHitRect();
+}
+
+/** A model that can answer, for when the chosen one can't: the last one picked on the first tab that's set up. */
+function standIn(): ModelPick | null {
+  for (const menu of ["anthropic", "openai", "google", "custom"] as const) {
+    if (tabStatus[menu] !== "ready") continue;
+    const last = rememberedModel(`kiki.model.${menu}`);
+    const items = modelItemNodes.filter((item) => item.dataset["tab"] === menu);
+    if (last && items.some((item) => item.dataset["model"] === last)) return last;
+    const first = items[0]?.dataset["model"];
+    if (first) return first as ModelPick;
+  }
+  return null;
+}
+
+/** Offers the models that are set up, and the ones the person added, from the popup's init. */
+function applyModels(init: PopupInit): void {
+  customModels = init.customModels;
+  tabStatus = { ...init.providers, ...(customModels.length ? { custom: "ready" as const } : {}) };
+  for (const item of modelItemNodes.filter((node) => node.dataset["tab"] === "custom")) item.remove();
+  modelItemNodes = [...modelItemNodes.filter((node) => node.dataset["tab"] !== "custom"), ...customModels.map((info) => menuItem(info.choice))];
+  // A model that can't be asked now (removed, or its key or sign-in is gone) gives way, for this popup.
+  const gone = isCustomModel(model) && !customModels.some((info) => info.choice === model);
+  if (gone || tabStatus[tabOf(model)] !== "ready") {
+    const other = standIn();
+    if (other) setModel(other, false);
+  } else setModel(model, false);
+  showTab(tabOf(model));
+}
+
+keepFocus(providerSettings);
+providerSettings.addEventListener("click", () => {
+  setModelMenu(false);
+  kiki.openSettings();
+});
+
 modelItems.addEventListener("pointerleave", hideHighlight);
+modelMenu.addEventListener("transitionend", (event) => {
+  if (event.target === modelMenu) reportHitRect();
+});
 modelMenu.addEventListener("keydown", (event) => {
+  if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+    // Between tabs: onto the next one's current (or first) model, or its Settings button.
+    const tabs = visibleTabs();
+    if (tabs.length < 2) return;
+    event.preventDefault();
+    const at = tabs.findIndex((tab) => tab.dataset["tab"] === menuTab);
+    const step = event.key === "ArrowRight" ? 1 : -1;
+    showTab(tabs[(at + step + tabs.length) % tabs.length]!.dataset["tab"] as MenuTab);
+    const items = visibleItems();
+    if (providerHint.hidden) (items.find((item) => item.dataset["model"] === model) ?? items[0])?.focus();
+    else providerSettings.focus();
+    return;
+  }
   if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
   event.preventDefault();
-  const items = [...modelItems.querySelectorAll<HTMLElement>(".menu-item")];
+  const items = visibleItems();
+  if (items.length === 0) return;
   const at = items.indexOf(document.activeElement as HTMLElement);
   const step = event.key === "ArrowDown" ? 1 : -1;
   items[(at + step + items.length) % items.length]?.focus();
@@ -778,10 +850,13 @@ document.addEventListener("pointerdown", (event) => {
 });
 
 effortButton.addEventListener("click", () => {
+  if (isCustomModel(model)) return;
   setEffort(EFFORT_LEVELS[(EFFORT_LEVELS.indexOf(effort) + 1) % EFFORT_LEVELS.length]!);
 });
 
-searchToggle.addEventListener("click", () => setToggle(searchToggle, !isOn(searchToggle)));
+searchToggle.addEventListener("click", () => {
+  if (!isCustomModel(model)) setToggle(searchToggle, !isOn(searchToggle));
+});
 
 // ---------- Screenshot ----------
 
@@ -839,8 +914,9 @@ screenshotToggle.addEventListener("click", async () => {
       return;
     }
     screenshotThumb = thumb;
-    // Before the first question it joins the context chips; after, it shows with the next question.
-    if (!started) showScreenshotChip(thumb);
+    // Before the first question it joins the context chips, as it does a new highlight's; otherwise it shows
+    // with the next question.
+    if (!started || pending) showScreenshotChip(thumb);
   }
   omit.screenshot = false;
   syncScreenshot();
@@ -848,17 +924,20 @@ screenshotToggle.addEventListener("click", async () => {
 
 // Clicking a control keeps the cursor in the question.
 for (const button of [mascot, modelButton, effortButton, searchToggle, screenshotToggle, attachButton, sendButton]) {
-  button.addEventListener("mousedown", (event) => event.preventDefault());
+  keepFocus(button);
 }
+thread.addEventListener("mousedown", (event) => {
+  if ((event.target as HTMLElement).closest(".code-copy")) event.preventDefault();
+});
 
 // ---------- Composer ----------
 
 function hasContent(): boolean {
-  return input.value.trim() !== "" || attachments.length > 0;
+  return input.value.trim() !== "" || attachments.length > 0 || fileAttachments.length > 0;
 }
 
 function updateSend(): void {
-  const label = busy ? "Stop" : hasContent() || started ? "Ask" : "Explain this";
+  const label = working() ? "Stop" : hasContent() || started ? "Ask" : "Explain this";
   sendButton.setAttribute("aria-label", label);
   sendButton.title = label;
 }
@@ -878,38 +957,60 @@ function isOn(button: HTMLButtonElement): boolean {
   return button.getAttribute("aria-pressed") === "true";
 }
 
+/** The first question is going out: the box is a conversation from now on. */
+function startConversation(): void {
+  started = true;
+  card.classList.add("started");
+  chips.classList.add("locked");
+  input.placeholder = "Ask a follow-up…";
+}
+
+/** The question's options from the composer: search, the model and the effort level. */
+function composerOptions(): QuestionOptions {
+  // Models the person added can't search, and think as they're set up to.
+  return isCustomModel(model) ? { search: false, model } : { search: isOn(searchToggle), model, effort };
+}
+
 async function ask(question: string): Promise<void> {
   question = question.trim();
   if (!question || busy) return;
   closeHistory();
   const images = attachments;
-  const options = { search: isOn(searchToggle), model, effort };
-  // Kiki sends the screenshot once: with the first question, or the first one after it's turned on.
-  const followUpShot = started && screenshotOn() && !screenshotSent ? screenshotThumb : null;
+  const files = fileAttachments;
+  const options = composerOptions();
+  // Kiki sends the screenshot once: with the first question, or the first one after it's turned on (with a
+  // new highlight, its chip shows it).
+  const followUpShot = started && !pending && screenshotOn() && !screenshotSent ? screenshotThumb : null;
   if (screenshotOn()) {
     screenshotSent = true;
     syncScreenshot();
   }
   if (!started) {
-    started = true;
-    card.classList.add("started");
-    chips.classList.add("locked");
+    startConversation();
     // The context chips lead the conversation from now on.
     threadContent.append(context);
-    input.placeholder = "Ask a follow-up…";
   }
-  threadContent.append(userMessage(question, [...(followUpShot ? [followUpShot] : []), ...images.map((i) => i.preview)]));
+  commitPending();
+  threadContent.append(
+    userMessage(
+      question,
+      [...(followUpShot ? [followUpShot] : []), ...images.map((i) => i.preview)],
+      files.map((file) => file.name),
+    ),
+  );
   input.value = "";
   attachments = [];
+  fileAttachments = [];
   renderAttachments();
   autoGrow();
-  current = new Answer();
+  current = new Answer(answerHost);
   setBusy(true);
   try {
     await kiki.ask({
       question,
       omit,
       images: images.map(({ mediaType, data }) => ({ mediaType, data })),
+      files: files.map(({ name, text, truncated }) => ({ name, text, ...(truncated ? { truncated } : {}) })),
       options,
     });
   } catch (error) {
@@ -918,7 +1019,7 @@ async function ask(question: string): Promise<void> {
   }
 }
 
-function userMessage(question: string, previews: string[]) {
+function userMessage(question: string, previews: string[], files: string[] = []) {
   const message = el("div", "msg user");
   if (previews.length > 0) {
     const row = el("div", "user-images");
@@ -930,9 +1031,22 @@ function userMessage(question: string, previews: string[]) {
     }
     message.append(row);
   }
+  if (files.length > 0) {
+    const row = el("div", "user-files");
+    for (const name of files) {
+      const chip = el("span", "file-chip");
+      chip.title = name;
+      chip.append(icon("file", 12), el("span", "file-name", name));
+      row.append(chip);
+    }
+    message.append(row);
+  }
   message.append(el("div", "user-text", question));
   return message;
 }
+
+/** Where new context chips go: the composer's, or a new highlight's after the first question. */
+let chipRow = chips;
 
 /** Adds a context chip whose ✕ leaves that context out. Returns a function that redraws it. */
 function addChip(
@@ -964,7 +1078,7 @@ function addChip(
   });
   sync();
   chip.append(text, remove);
-  chips.append(chip);
+  chipRow.append(chip);
   return sync;
 }
 
@@ -991,26 +1105,156 @@ function addWindowChip(appName: string | undefined, windowTitle: string | undefi
   if (windowLabel) addChip(windowLabel, "window", { title: windowLabel, name: "the window name" });
 }
 
+/** The chip saying where Kiki is looking when it isn't the window the question came from. */
+let targetChip: HTMLElement | null = null;
+
+function setTargetChip(kind: "browser" | "window", label: string | null): void {
+  targetChip?.remove();
+  targetChip = null;
+  if (!label) return;
+  const chip = el("span", "chip target");
+  chip.append(icon(kind === "browser" ? "globe" : "appWindow", 12), el("span", "chip-label", `${kind === "browser" ? "Kiki's browser" : "Window"}: ${label}`));
+  chip.title = label;
+  chips.append(chip);
+  targetChip = chip;
+}
+
+/** The window's chips (`withWindow`; otherwise only the screenshot's) and the camera button for it. */
+function renderWindow(info: WindowContext, withWindow = true): void {
+  if (withWindow) {
+    addWindowChip(info.appName, info.windowTitle);
+    setTextChip(info.textChars, info.textPreview);
+  }
+  if (info.screenshotThumb) {
+    screenshotThumb = info.screenshotThumb;
+    showScreenshotChip(info.screenshotThumb);
+  }
+  screenshotUnavailable = info.screenshot === "unavailable";
+  screenshotToggle.hidden = !info.screenshot;
+  syncScreenshot();
+}
+
 function renderContext(init: PopupInit): void {
-  addWindowChip(init.appName, init.windowTitle);
-  setTextChip(init.textChars, init.textPreview);
-  if (init.screenshotThumb) {
-    screenshotThumb = init.screenshotThumb;
-    showScreenshotChip(init.screenshotThumb);
-  }
-  if (init.screenshot) {
-    screenshotUnavailable = init.screenshot === "unavailable";
-    screenshotToggle.hidden = false;
-    syncScreenshot();
-  }
+  renderWindow(init);
   googleConnected = init.google;
+  applyModels(init);
   editTarget = init.edit;
   formFields = init.fields;
   if (!init.configured) showError("Kiki isn't set up yet.", "unauthorized");
 }
 
+// ---------- The hotkey, pressed again while Kiki is open ----------
+
+/**
+ * A highlight the hotkey brought in after the first question, waiting for the next one: its chips above
+ * the question, and where cards for its window write.
+ */
+let pending: {
+  root: HTMLElement;
+  chips: HTMLElement;
+  /** The window's chips show too (another page, or nothing highlighted). */
+  withWindow: boolean;
+  highlight: HTMLElement | null;
+  edit?: EditInfo;
+  fields?: FormField[];
+} | null = null;
+
+/** Forgets the screenshot of the window before: the camera is for the new one. */
+function resetScreenshot(): void {
+  delete omit.screenshot;
+  screenshotThumb = null;
+  screenshotSent = false;
+  syncScreenshotChip = null;
+}
+
+/** Clears the chips and what they stood for: the popup starts over, with another window or a past session. */
+function resetContext(): void {
+  for (const key of Object.keys(omit) as Array<keyof ContextOmissions>) delete omit[key];
+  pending?.root.remove();
+  pending = null;
+  chipRow = chips;
+  resetScreenshot();
+  textCount = null;
+  notes.hidden = true;
+  chips.replaceChildren();
+}
+
+/**
+ * The chat takes in what the hotkey read. Before the first question, the popup starts over with the new
+ * window; after it, the new highlight (and its window, when that's new) waits above the next question.
+ */
+function takeCapture(event: Extract<PopupEvent, { type: "recapture" }>): void {
+  closeHistory();
+  if (event.fresh && !started) {
+    resetContext();
+    renderWindow(event);
+    editTarget = event.edit;
+    formFields = event.fields;
+  } else {
+    pending?.root.remove();
+    delete omit.selection;
+    // Another page's context starts out sent, like the first one's; on the same page, earlier choices stand.
+    if (event.withWindow) {
+      delete omit.window;
+      delete omit.text;
+      textCount = null;
+    }
+    resetScreenshot();
+    const root = el("div", "context pending");
+    const row = el("div", "chips");
+    root.append(row);
+    composer.insertBefore(root, attachmentsRow);
+    pending = {
+      root,
+      chips: row,
+      withWindow: event.withWindow,
+      highlight: null,
+      edit: event.edit,
+      fields: event.fields,
+    };
+    chipRow = row;
+    setHighlightChip(event.selection);
+    renderWindow(event, event.withWindow);
+  }
+  layout();
+  input.focus();
+}
+
+/**
+ * The new highlight's chip: what's highlighted, which its ✕ leaves out. Nothing highlighted removes it: the
+ * window's full read found the highlight was from another window.
+ */
+function setHighlightChip(selection: string): void {
+  const text = clip(selection, 48);
+  if (!pending || pending.highlight?.title === selection) return;
+  pending.highlight?.remove();
+  pending.highlight = null;
+  if (!text) return;
+  addChip(`Highlighted · “${text}”`, "selection", {
+    title: selection,
+    name: "the highlighted text",
+  });
+  pending.highlight = pending.chips.lastElementChild as HTMLElement;
+  // It leads the row.
+  pending.chips.prepend(pending.highlight);
+}
+
+/** The new highlight goes with the question being asked: its chips move into the conversation above it. */
+function commitPending(): void {
+  if (!pending) return;
+  pending.root.classList.remove("pending");
+  pending.chips.classList.add("locked");
+  threadContent.append(pending.root);
+  editTarget = pending.edit;
+  formFields = pending.fields;
+  pending = null;
+}
+
 thread.addEventListener("click", (event) => {
-  const link = (event.target as HTMLElement).closest("a");
+  const target = event.target as HTMLElement;
+  const copy = target.closest<HTMLElement>(".code-copy");
+  if (copy) return copyCode(copy);
+  const link = target.closest("a");
   if (link?.href) {
     event.preventDefault();
     kiki.openLink(link.href);
@@ -1018,12 +1262,14 @@ thread.addEventListener("click", (event) => {
 });
 
 function defaultQuestion(): string {
-  return attachments.length > 0 ? "What's in this image?" : "Explain this.";
+  if (attachments.length > 0) return "What's in this image?";
+  if (fileAttachments.length > 0) return fileAttachments.length === 1 ? "Summarize this file." : "Summarize these files.";
+  return "Explain this.";
 }
 
 composer.addEventListener("submit", (event) => {
   event.preventDefault();
-  if (busy) kiki.cancel();
+  if (working()) kiki.cancel();
   else void ask(input.value || defaultQuestion());
 });
 
@@ -1034,14 +1280,14 @@ input.addEventListener("input", () => {
 input.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
-    if (busy) return;
+    if (working()) return;
     void ask(input.value || defaultQuestion());
   }
 });
 
-// ---------- Images: paste, drop, or pick ----------
+// ---------- Images and text files: paste, drop, or pick ----------
 
-let nextImageId = 0;
+let nextAttachmentId = 0;
 
 /** Downscales an image to what Claude reads at full detail, as JPEG. */
 async function loadImage(file: Blob): Promise<Screenshot & { preview: string; id: number }> {
@@ -1057,59 +1303,91 @@ async function loadImage(file: Blob): Promise<Screenshot & { preview: string; id
   ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
   bitmap.close();
   const preview = canvas.toDataURL("image/jpeg", 0.85);
-  return { mediaType: "image/jpeg", data: preview.slice(preview.indexOf(",") + 1), preview, id: nextImageId++ };
+  return { mediaType: "image/jpeg", data: preview.slice(preview.indexOf(",") + 1), preview, id: nextAttachmentId++ };
 }
 
-async function addImages(files: Iterable<File>): Promise<void> {
-  for (const file of files) {
-    if (!file.type.startsWith("image/")) continue;
-    if (attachments.length >= LIMITS.imagesPerQuestion) {
-      flashNote(`You can attach up to ${LIMITS.imagesPerQuestion} images per question.`);
-      break;
-    }
-    try {
-      const image = await loadImage(file);
-      if (image.data.length > LIMITS.screenshotBase64Chars) throw new Error("too large");
-      attachments.push(image);
-    } catch {
-      flashNote("Kiki couldn't read that image.");
-    }
+async function addImage(file: File): Promise<void> {
+  if (attachments.length >= LIMITS.imagesPerQuestion) {
+    return flashNote(`You can attach up to ${LIMITS.imagesPerQuestion} images per question.`);
+  }
+  try {
+    const image = await loadImage(file);
+    if (image.data.length > LIMITS.screenshotBase64Chars) throw new Error("too large");
+    attachments.push(image);
+  } catch {
+    flashNote("Kiki couldn't read that image.");
+  }
+}
+
+/** A Markdown, text or code file, sent as its text. */
+async function addTextFile(file: File): Promise<void> {
+  if (fileAttachments.length >= LIMITS.filesPerQuestion) {
+    return flashNote(`You can attach up to ${LIMITS.filesPerQuestion} files per question.`);
+  }
+  const read = file.size <= MAX_FILE_BYTES ? readTextFile(new Uint8Array(await file.arrayBuffer())) : null;
+  if (!read) return flashNote("Kiki can read images and text files, like .md, .txt or code.");
+  const name = file.name.slice(0, LIMITS.fileNameChars) || "file";
+  fileAttachments.push({ name, ...read, id: nextAttachmentId++ });
+}
+
+async function addFiles(files: Iterable<File>): Promise<void> {
+  // A copy first: the picker's and a drop's file lists empty out once the event is over.
+  for (const file of [...files]) {
+    if (file.type.startsWith("image/")) await addImage(file);
+    else await addTextFile(file).catch(() => flashNote("Kiki couldn't read that file."));
   }
   renderAttachments();
   input.focus();
 }
 
-/** Thumbnails by image, so the ones already showing don't drop in again. */
+/** Thumbnails by attachment, so the ones already showing don't drop in again. */
 const thumbs = new Map<number, HTMLElement>();
 
 function renderAttachments(): void {
   let added = 0;
-  const nodes = attachments.map((image, index) => {
-    let thumb = thumbs.get(image.id);
-    if (!thumb) {
-      thumb = el("div", "thumb");
-      thumb.style.setProperty("--i", String(added++));
-      const img = el("img");
-      img.src = image.preview;
-      img.alt = `Attached image ${index + 1}`;
-      const remove = el("button");
-      remove.type = "button";
-      remove.setAttribute("aria-label", "Remove image");
-      remove.append(icon("x", 9, 3));
-      remove.addEventListener("click", () => {
-        attachments = attachments.filter((item) => item.id !== image.id);
+  const thumb = (id: number, content: Node[], label: string, remove: () => void) => {
+    let node = thumbs.get(id);
+    if (!node) {
+      node = el("div", "thumb");
+      node.style.setProperty("--i", String(added++));
+      const button = el("button");
+      button.type = "button";
+      button.setAttribute("aria-label", label);
+      button.append(icon("x", 9, 3));
+      button.addEventListener("click", () => {
+        remove();
         renderAttachments();
         input.focus();
       });
-      thumb.append(img, remove);
-      thumbs.set(image.id, thumb);
+      node.append(...content, button);
+      thumbs.set(id, node);
     }
-    return thumb;
-  });
-  for (const id of [...thumbs.keys()]) if (!attachments.some((image) => image.id === id)) thumbs.delete(id);
+    return node;
+  };
+  const nodes = [
+    ...attachments.map((image, index) => {
+      const img = el("img");
+      img.src = image.preview;
+      img.alt = `Attached image ${index + 1}`;
+      return thumb(image.id, [img], "Remove image", () => {
+        attachments = attachments.filter((item) => item.id !== image.id);
+      });
+    }),
+    ...fileAttachments.map((file) => {
+      const node = thumb(file.id, [icon("file", 14), el("span", "file-name", file.name)], `Remove ${file.name}`, () => {
+        fileAttachments = fileAttachments.filter((item) => item.id !== file.id);
+      });
+      node.classList.add("file");
+      node.title = file.truncated ? `${file.name} (only its start is sent)` : file.name;
+      return node;
+    }),
+  ];
+  const ids = new Set([...attachments, ...fileAttachments].map((item) => item.id));
+  for (const id of [...thumbs.keys()]) if (!ids.has(id)) thumbs.delete(id);
   attachmentsRow.replaceChildren(...nodes);
-  attachmentsRow.hidden = attachments.length === 0;
-  attachButton.disabled = attachments.length >= LIMITS.imagesPerQuestion;
+  attachmentsRow.hidden = nodes.length === 0;
+  attachButton.disabled =
+    attachments.length >= LIMITS.imagesPerQuestion && fileAttachments.length >= LIMITS.filesPerQuestion;
   updateSend();
 }
 
@@ -1128,10 +1406,10 @@ function flashNote(message: string): void {
 }
 
 document.addEventListener("paste", (event) => {
-  const files = [...(event.clipboardData?.files ?? [])].filter((file) => file.type.startsWith("image/"));
+  const files = [...(event.clipboardData?.files ?? [])];
   if (files.length === 0) return;
   event.preventDefault();
-  void addImages(files);
+  void addFiles(files);
 });
 
 card.addEventListener("dragover", (event) => {
@@ -1145,7 +1423,7 @@ card.addEventListener("dragleave", (event) => {
 card.addEventListener("drop", (event) => {
   event.preventDefault();
   card.classList.remove("dropping");
-  void addImages(event.dataTransfer?.files ?? []);
+  void addFiles(event.dataTransfer?.files ?? []);
 });
 
 attachButton.addEventListener("click", () => {
@@ -1153,7 +1431,7 @@ attachButton.addEventListener("click", () => {
   fileInput.click();
 });
 fileInput.addEventListener("change", () => {
-  void addImages(fileInput.files ?? []);
+  void addFiles(fileInput.files ?? []);
   fileInput.value = "";
 });
 fileInput.addEventListener("cancel", () => {
@@ -1182,6 +1460,8 @@ function showHistory(items: HistoryItem[]): void {
     clear: () => {
       void kiki.clearHistory().finally(() => showHistory([]));
     },
+    settings: () => kiki.openSettings(),
+    save: (item, saved) => kiki.saveSession(item.id, saved).catch(() => false),
   });
   if (!historyOpen) threadScroll = thread.scrollTop;
   historyOpen = true;
@@ -1214,15 +1494,22 @@ async function openPast(item: HistoryItem): Promise<void> {
   }
 }
 
+/** What a past question was about, when the hotkey brought its highlight into the chat. */
+function highlightNote(highlight: string): HTMLElement {
+  const note = el("div", "user-note", `Highlighted “${clip(highlight, 80)}”`);
+  note.title = highlight;
+  return note;
+}
+
 /** A finished answer from a past session, shown whole. */
 function pastAnswer(turn: PastTurn): HTMLElement {
   const message = el("div", "msg assistant");
   const body = el("div", "answer");
-  body.innerHTML = renderMarkdown(turn.answer);
+  body.replaceChildren(renderMarkdown(turn.answer));
   message.append(body);
   if (turn.actions?.length) {
     const cards = el("div", "action-cards");
-    cards.append(...turn.actions.map(actionCard));
+    cards.append(...turn.actions.map(answerHost.card));
     message.append(cards);
   }
   if (turn.sources?.length) message.append(sourceList(turn.sources));
@@ -1236,26 +1523,22 @@ function pastAnswer(turn: PastTurn): HTMLElement {
  */
 function loadSession(past: PastSession): void {
   attachments = [];
+  fileAttachments = [];
   renderAttachments();
-  for (const key of Object.keys(omit) as Array<keyof ContextOmissions>) delete omit[key];
-  screenshotThumb = null;
+  resetContext();
+  // Its screenshot (if any) wasn't kept, and the one for this window doesn't belong to it.
   screenshotSent = true;
-  syncScreenshotChip = null;
   screenshotToggle.hidden = true;
-  textCount = null;
-  notes.hidden = true;
-  chips.replaceChildren();
   addWindowChip(past.appName, past.windowTitle);
   setTextChip(past.textChars, past.textPreview);
 
-  started = true;
-  card.classList.add("started");
-  chips.classList.add("locked");
-  input.placeholder = "Ask a follow-up…";
+  startConversation();
   threadContent.replaceChildren(context);
   for (const turn of past.turns) {
     const question = userMessage(turn.question, []);
-    if (turn.images) question.prepend(el("div", "user-note", `Sent ${plural(turn.images, "image")}`));
+    const sent = [turn.images ? plural(turn.images, "image") : "", ...(turn.files ?? [])].filter(Boolean);
+    if (sent.length) question.prepend(el("div", "user-note", `Sent ${sent.join(" · ")}`));
+    if (turn.highlight) question.prepend(highlightNote(turn.highlight));
     threadContent.append(question, pastAnswer(turn));
   }
   closeHistory();
@@ -1290,4 +1573,6 @@ void kiki.init().then((init) => {
   input.focus();
   ready = true;
   layout();
+  // A Claude Code process for the question starts now, so it doesn't wait for one.
+  if (init) kiki.warm(composerOptions());
 });

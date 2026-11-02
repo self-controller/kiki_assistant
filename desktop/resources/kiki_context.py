@@ -4,6 +4,11 @@
   kiki_context.py              Active app, window title and visible text via AT-SPI
                                (terminals and editors: only the text around the selection or caret),
                                and where Kiki could write at the cursor ("edit")
+  kiki_context.py --quick      The same without a page's (or window's) text: only what needs the window to be
+                               the active one, before Kiki's popup opens ("hasText" says there is some)
+  kiki_context.py --text       Only the text, without looking for the selection or the caret
+  kiki_context.py --source JSON  With --text: that window ({"pid", "window"} from a quick read), not the active one
+  kiki_context.py --wait       Starts, then reads the arguments as one JSON list on stdin (so it's ready sooner)
   kiki_context.py --edit JSON  Writes text where an earlier read's "edit" pointed: {"pid", "path", "role",
                                "start", "end", "expected", "text", "whole"?}
   kiki_context.py --check-changes JSON   Finds each change's text in an editable object, once:
@@ -21,6 +26,8 @@
   kiki_context.py --scroll JSON  Scrolls a page there over AT-SPI, then reads the screen: {"pid", "window"} plus
                                {"direction": "down" | "up"} or {"to": text on the page}
   kiki_context.py --docs-dialog JSON  Google Docs' Find and replace dialog in the app with {"pid"}
+  kiki_context.py --find-window JSON  Where AT-SPI has a desktop window: {"pid", "title"} (the GNOME extension's
+                               ListWindows) -> {"pid", "window", "toolkit", "source"}, for --screen and friends
   kiki_context.py --screenshot Full-screen screenshot via the XDG desktop portal
   kiki_context.py --delay 3    Wait first (for testing: highlight text, then switch windows)
   kiki_context.py --check      Exit successfully if AT-SPI is importable
@@ -77,18 +84,19 @@ ANCHOR_SKIP_ROLES = SKIP_ROLES - {Atspi.Role.TOOL_BAR}
 DOCUMENT_ROLES = {Atspi.Role.DOCUMENT_WEB, Atspi.Role.DOCUMENT_FRAME}
 # Text where only the lines around the selection or caret matter: terminals and multi-line editors.
 EDITOR_ROLES = {Atspi.Role.TEXT, Atspi.Role.DOCUMENT_TEXT, Atspi.Role.ENTRY}
+# How long the search for the selection or caret may take, whatever the read's own budget.
+ANCHOR_SECONDS = 0.4
 # How much to read on each side of the selection or caret; Kiki trims it to whole lines.
 VICINITY_BEFORE = 16_000
 VICINITY_AFTER = 8_000
 # How far from where it was read an edit looks for the text it replaces, if that has moved.
 RELOCATE_CHARS = 4_000
-# Toolkits whose AT-SPI text writes do nothing (Firefox and Zen, verified) or aren't known to work (Chromium,
-# Electron): Kiki selects the text there over AT-SPI and pastes over it instead.
-SELECT_PASTE_TOOLKITS = {"gecko", "chromium"}
 # The most of an editable text (a field, a compose box) Kiki reads whole, to change it in several places.
 EDITABLE_CHARS = 16_000
 # The most text read from one editable object (and what it embeds) to find changes in.
 FLATTEN_CHARS = 400_000
+# The most of a rich text the hotkey's read flattens for the editable text; the rest waits for --check-changes.
+CAPTURE_FLATTEN_CHARS = 48_000
 # Fields a form fill can set: text fields (never passwords), check boxes and radio buttons.
 TEXT_FIELD_ROLES = {Atspi.Role.ENTRY, Atspi.Role.TEXT}
 TOGGLE_ROLES = {Atspi.Role.CHECK_BOX, Atspi.Role.RADIO_BUTTON}
@@ -194,6 +202,19 @@ def own_text(obj, budget):
     return text
 
 
+def embedded_kids(kids, count):
+    """The children that `count` U+FFFC in an object's text stand for, in order, from its (index, child) pairs.
+
+    Gecko (Firefox, Zen) lists only embedded children, so they're simply in order. Chromium also lists the plain
+    text around them as children ("static" text leaves), which its text already holds: the other children are
+    the embedded ones.
+    """
+    if len(kids) == count:
+        return kids
+    embedded = [(index, kid) for index, kid in kids if safe(kid.get_role) != Atspi.Role.STATIC]
+    return embedded if len(embedded) == count else kids
+
+
 def collect(obj, budget, depth=0, path=()):
     """Reading-order text for obj's subtree, stopping when the budget runs out.
 
@@ -255,7 +276,7 @@ def collect_text(obj, role, states, budget, depth, path):
         # Hypertext: each U+FFFC stands for the next child (a link, an inline element...).
         pieces = text.split(EMBEDDED_OBJECT)
         out = [pieces[0]]
-        kids = list(indexed_children(obj))
+        kids = embedded_kids(list(indexed_children(obj)), len(pieces) - 1)
         for index, piece in enumerate(pieces[1:]):
             if index < len(kids) and not budget.exhausted():
                 child_index, kid = kids[index]
@@ -267,10 +288,15 @@ def collect_text(obj, role, states, budget, depth, path):
     return text
 
 
+def extents_of(obj):
+    """obj's extents in its window (with x, y, width and height), or None when the toolkit doesn't say."""
+    component = safe(obj.get_component_iface)
+    return safe(lambda: Atspi.Component.get_extents(component, Atspi.CoordType.WINDOW)) if component else None
+
+
 def window_box(obj):
     """obj's extents in its window as (x, y, width, height), or None when the toolkit doesn't say."""
-    component = safe(obj.get_component_iface)
-    extents = safe(lambda: Atspi.Component.get_extents(component, Atspi.CoordType.WINDOW)) if component else None
+    extents = extents_of(obj)
     if extents is None or extents.width <= 0 or extents.height <= 0:
         return None
     return (extents.x, extents.y, extents.width, extents.height)
@@ -315,8 +341,7 @@ def visible_lines(obj, text):
     All of `text` when the toolkit can't say.
     """
     iface = safe(obj.get_text_iface)
-    component = safe(obj.get_component_iface)
-    extents = safe(lambda: Atspi.Component.get_extents(component, Atspi.CoordType.WINDOW)) if component else None
+    extents = extents_of(obj)
     if iface is None or extents is None or extents.width <= 2 or extents.height <= 2:
         return text
     at = lambda x, y: safe(lambda: Atspi.Text.get_offset_at_point(iface, x, y, Atspi.CoordType.WINDOW), -1)  # noqa: E731
@@ -359,6 +384,10 @@ def note_field(obj, role, states, path, budget):
             return
         kind = "textarea" if states.contains(Atspi.StateType.MULTI_LINE) else "text"
         field.update(kind=kind, value=value, length=count)
+        # Kiki never types into these on its own (act refuses); a fill card may, with the person's approval.
+        if role == Atspi.Role.PASSWORD_TEXT:
+            field["password"] = True
+            field["value"] = ""
     budget.fields.append(field)
 
 
@@ -394,6 +423,17 @@ def selected_span(iface):
     return None
 
 
+def page_selected(document):
+    """Whether anything is highlighted in a web page, or None when the toolkit doesn't say.
+
+    Gecko's document spans the whole page's selection, so one call answers without reading any text.
+    """
+    iface = safe(document.get_text_iface)
+    if iface is None:
+        return None
+    return selected_span(iface) is not None
+
+
 def vicinity_kind(obj):
     """The kind of text ("terminal" or "editor") where only the lines near the selection matter, or None."""
     role = safe(obj.get_role)
@@ -420,6 +460,9 @@ def find_anchor(obj, budget, found, depth=0, in_toolbar=False):
     iface = safe(obj.get_text_iface)
     # Hidden tabs are "visible" but not "showing"; their stale selections don't count.
     if iface is not None and has_state(obj, Atspi.StateType.SHOWING):
+        # Whether the window shows any text, for a read that leaves it for later: counted, not read.
+        if "text" not in found and (safe(lambda: Atspi.Text.get_character_count(iface), 0) or 0) > 0:
+            found["text"] = True
         focused = has_state(obj, Atspi.StateType.FOCUSED)
         # An address bar keeps its highlight after the person clicks into the page.
         span = selected_span(iface) if focused or not in_toolbar else None
@@ -434,13 +477,16 @@ def find_anchor(obj, budget, found, depth=0, in_toolbar=False):
             return
 
 
-def find_text_anchor(window, max_seconds):
+def find_text_anchor(window, max_seconds, seen=None):
     """The text object in window holding the selection, or else the focused one, or None.
 
     Returns (obj, iface, start, end); at a caret, start and end are both the caret offset (-1 if unknown).
+    Sets seen["text"] when it passed text on screen.
     """
     found = {}
     find_anchor(window, Budget(1, max_seconds, max_nodes=3_000), found)
+    if seen is not None and "text" in found:
+        seen["text"] = True
     if "selected" in found:
         obj, iface, (start, end) = found["selected"]
     elif "focused" in found:
@@ -449,6 +495,25 @@ def find_text_anchor(window, max_seconds):
     else:
         return None
     return obj, iface, start, end
+
+
+def focused_in(root):
+    """The focused, editable object under root (a page's field), or None; False when the toolkit can't say.
+
+    One AT-SPI Collection call, which the app answers from its own tree: much faster than collect() walking
+    a page, and it doesn't read any text.
+    """
+    collection = safe(root.get_collection_iface)
+    if collection is None:
+        return False
+    try:
+        states = Atspi.StateSet.new([Atspi.StateType.FOCUSED, Atspi.StateType.EDITABLE])
+        every = Atspi.CollectionMatchType.ALL
+        rule = Atspi.MatchRule.new(states, every, {}, every, [], Atspi.CollectionMatchType.ANY, [], every, False)
+        matches = Atspi.Collection.get_matches(collection, rule, Atspi.CollectionSortOrder.CANONICAL, 1, True)
+    except Exception:  # Not every toolkit implements Collection.
+        return False
+    return matches[0] if matches else None
 
 
 def read_vicinity(anchor):
@@ -652,20 +717,27 @@ def normalize(text):
     return "\n".join(out).strip()
 
 
-def capture_context(max_chars, max_seconds):
-    desktop = Atspi.get_desktop(0)
-    app, window = find_active_window(desktop)
-    if window is None:
-        # Nothing focused is exposed over AT-SPI (e.g. a browser with accessibility off).
-        return {"ok": True, "appName": None, "windowTitle": None, "text": "", "selection": "", "source": "none"}
+def capture_context(max_chars, max_seconds, cursor=True, page=True, source=None):
+    """The active window's context, or with `source` ({"pid", "window"} from an earlier read) that window's: the
+    full read runs once Kiki's popup may be the active window."""
+    if source is not None:
+        app, window = find_source(int(source["pid"]), source.get("window"))
+        if window is None:
+            return {"ok": False, "error": "the window is gone"}
+    else:
+        app, window = find_active_window(Atspi.get_desktop(0))
+        if window is None:
+            # Nothing focused is exposed over AT-SPI (e.g. a browser with accessibility off).
+            return {"ok": True, "appName": None, "windowTitle": None, "text": "", "selection": "", "source": "none"}
+    return read_window(app, window, max_chars, max_seconds, cursor=cursor, page=page)
 
-    return read_window(app, window, max_chars, max_seconds)
 
-
-def read_window(app, window, max_chars, max_seconds):
+def read_window(app, window, max_chars, max_seconds, cursor=True, page=True):
     """What capture_context reports for one window; tests call it on windows that aren't active.
 
     For pages, "focus" is the offset in "text" of the middle of what is on screen, when some of it isn't.
+    `cursor`: look for the selection and the caret, which needs the window to still be the active one.
+    Without `page`, the page's (or the window's) text is left for a later read: "hasText" says there is some.
     """
     names = {
         "ok": True,
@@ -676,7 +748,8 @@ def read_window(app, window, max_chars, max_seconds):
         # So --screen and --scroll can find this window again once Kiki's popup is the active one.
         "window": path_from_app(window),
     }
-    anchor = find_text_anchor(window, max_seconds / 2)
+    seen = {}
+    anchor = find_text_anchor(window, ANCHOR_SECONDS, seen) if cursor else None
     target = anchor_target(app, anchor)
     vicinity = read_vicinity(anchor)
     if vicinity is not None:
@@ -686,27 +759,45 @@ def read_window(app, window, max_chars, max_seconds):
     budget = Budget(max_chars, max_seconds, max_nodes=20_000)
     document = find_document(window)
     root = document or window
-    raw = collect(root, budget)
-    text, focus = split_focus(normalize(settle_markers(raw)), budget.on_screen, max_chars - budget.chars_left)
+    field = focused_in(root) if cursor and not page and document is not None else None
+    if page or field is False:
+        # Without a quick way to find the cursor in a page, the read looks for it on the way.
+        raw = collect(root, budget)
+        text, focus = split_focus(normalize(settle_markers(raw)), budget.on_screen, max_chars - budget.chars_left)
+        truncated, later = budget.exhausted(), None
+    else:
+        budget.focused_editable = field
+        text, focus, truncated = "", None, False
+        later = document is not None or "text" in seen
     result = {
         **names,
         "text": text,
         "selection": normalize("\n".join(budget.selections)),
         "source": "document" if document is not None else "window",
-        "truncated": budget.exhausted(),
+        "truncated": truncated,
     }
+    if later is not None:
+        result["hasText"] = later
+    # Nothing highlighted in the page: the primary selection is from another window, or from long ago.
+    selected = page_selected(document) if cursor and document is not None else None
+    if selected is not None:
+        result["pageSelected"] = selected
     if focus is not None:
         result["focus"] = focus
     url = document_url(document) if document is not None else None
     if url:
         result["url"] = url
+    title = document_title(document) if document is not None else None
+    if title:
+        result["pageTitle"] = title
     # One field alone is where the cursor is, for an edit; a form has more.
     base = path_from_app(root) if len(budget.fields) >= 2 else None
     if base is not None:
         result["fields"] = [{**field, "path": base + field["path"]} for field in budget.fields]
     # A focused field in a page (or the window) beats a caret found outside it.
     target_obj = anchor[0] if target and anchor else None
-    if budget.focused_editable is not None:
+    # Only a read that looks for the cursor says where to write: the full read's edit target would go unused.
+    if cursor and budget.focused_editable is not None:
         focused = edit_target(app, budget.focused_editable)
         if focused:
             target, target_obj = focused, budget.focused_editable
@@ -721,12 +812,26 @@ def read_window(app, window, max_chars, max_seconds):
     return result
 
 
+# Where browsers keep a document's address: Gecko (Firefox, Zen) says "DocURL", Chromium and WebKitGTK "URI".
+URL_ATTRIBUTES = ("DocURL", "URI")
+
+
 def document_url(document):
     """The address of a browser's web document, or None."""
     iface = safe(document.get_document_iface)
     if iface is None:
         return None
-    return safe(lambda: Atspi.Document.get_document_attribute_value(iface, "DocURL")) or None
+    for name in URL_ATTRIBUTES:
+        url = safe(lambda: Atspi.Document.get_document_attribute_value(iface, name))
+        if url:
+            return url
+    return None
+
+
+def document_title(document):
+    """A web document's own title (its accessible name), or None: the window's title has the browser's name too."""
+    title = " ".join((safe(document.get_name) or "").split())
+    return title[:500] or None
 
 
 def text_runs(obj, runs, budget, depth=0):
@@ -751,7 +856,7 @@ def text_runs(obj, runs, budget, depth=0):
             runs.append((obj, 0, text))
         return
     pieces = text.split(EMBEDDED_OBJECT)
-    kids = list(children(obj))
+    kids = [kid for _index, kid in embedded_kids(list(indexed_children(obj)), len(pieces) - 1)]
     offset = 0
     for index, piece in enumerate(pieces):
         if piece:
@@ -766,14 +871,14 @@ def text_runs(obj, runs, budget, depth=0):
                 runs.append((None, 0, "\n"))
 
 
-def flatten(obj):
+def flatten(obj, limit=FLATTEN_CHARS):
     """obj's text as one string, with a line break between blocks, and where each piece of it lives.
 
     Returns (text, placed): `placed` holds (offset in text, node, offset in node's text, run text) per run.
     The same object always flattens the same way, so offsets from one read hold for the next.
     """
     runs = []
-    text_runs(obj, runs, [FLATTEN_CHARS])
+    text_runs(obj, runs, [limit])
     out, placed, at, pending = [], [], 0, False
     for node, start, text in runs:
         if node is None:
@@ -790,14 +895,19 @@ def flatten(obj):
 
 
 def editable_text(obj, around):
-    """The text changes in several places see (flatten()), cut to EDITABLE_CHARS around a plain text's caret."""
-    text, placed = flatten(obj)
+    """The text changes in several places see, cut to EDITABLE_CHARS: a plain field's text around its caret (at
+    `around`), read in one call however long the field is; rich text (a compose box) flattened, from its start."""
+    iface = safe(obj.get_text_iface)
+    if iface is not None:
+        count = safe(lambda: Atspi.Text.get_character_count(iface), 0) or 0
+        start = max(0, min(around - EDITABLE_CHARS // 2, count - EDITABLE_CHARS))
+        plain = safe(lambda: Atspi.Text.get_text(iface, start, min(start + EDITABLE_CHARS, count)), None)
+        if plain is not None and EMBEDDED_OBJECT not in plain:
+            return {"text": plain, "truncated": True} if count > EDITABLE_CHARS else {"text": plain}
+    text, _placed = flatten(obj, CAPTURE_FLATTEN_CHARS)
     if len(text) <= EDITABLE_CHARS:
         return {"text": text}
-    # A plain field is one run, so its caret offset is an offset in the text; rich text keeps its start.
-    middle = around if len(placed) == 1 and placed[0][2] == 0 else 0
-    start = max(0, min(middle - EDITABLE_CHARS // 2, len(text) - EDITABLE_CHARS))
-    return {"text": text[start : start + EDITABLE_CHARS], "truncated": True}
+    return {"text": text[:EDITABLE_CHARS], "truncated": True}
 
 
 def locate(text, placed, find):
@@ -853,11 +963,14 @@ def relocate(text, expected, at):
     return first
 
 
+def app_by_pid(pid):
+    """The application with process id `pid` on the desktop, or None when it's gone."""
+    return next((a for a in children(Atspi.get_desktop(0)) if safe(a.get_process_id) == pid), None)
+
+
 def find_by_path(pid, path, role):
     """The object an edit target's path leads to in the app with that pid, if its role still matches."""
-    desktop = Atspi.get_desktop(0)
-    app = next((a for a in children(desktop) if safe(a.get_process_id) == pid), None)
-    node = app
+    node = app_by_pid(pid)
     for index in path:
         if node is None:
             return None
@@ -940,7 +1053,8 @@ def apply_changes(request):
     """Writes every change over AT-SPI, or none when one can't be found (reason "changed").
 
     Goes from the last change to the first, so the earlier ones stay where they were found. "applied" lists
-    the indices written, also when a write fails part of the way through.
+    the indices written, also when a write fails part of the way through, and "written" says where each one
+    is now ({"index", "path", "role", "start", "end"}), so Kiki's Undo can put the original back by span.
     """
     obj = target_of(request)
     if obj is None:
@@ -951,13 +1065,21 @@ def apply_changes(request):
     if any(item["status"] != "ok" for item in found):
         return {"ok": False, "reason": "changed", "applied": [], "results": [public(item) for item in found]}
     applied = []
+    written = []
     for index in sorted(range(len(changes)), key=lambda i: found[i]["at"], reverse=True):
         item, change = found[index], changes[index]
         result = write_at(item["node"], item["start"], change["find"], change["replace"])
         if not result["ok"]:
-            return {"ok": False, "reason": result["reason"], "applied": applied}
+            return {"ok": False, "reason": result["reason"], "applied": applied, "written": written}
         applied.append(index)
-    return {"ok": True, "applied": applied}
+        written.append({
+            "index": index,
+            "path": path_from_app(item["node"]),
+            "role": safe(item["node"].get_role_name),
+            "start": result["start"],
+            "end": result["end"],
+        })
+    return {"ok": True, "applied": applied, "written": written}
 
 
 def wait_for(check, seconds=1.5):
@@ -1091,9 +1213,9 @@ def page_loading(window):
 
 def click(request):
     """Presses a link or button like press(), then waits for what it opens: a new page (the address showing
-    changes, also when it opened in a new tab) until it has loaded, or else a moment for the page to change in
-    place. Returns the screen as it settled (see settled_screen()), plus "navigated", or {"ok": false, "reason"}
-    as press() does.
+    changes, also when it opened in a new tab) until it has loaded, or else the page to change in place, for at
+    most CLICK_QUIET_SECONDS. Returns the screen as it settled (see settled_screen()), plus "navigated", or
+    {"ok": false, "reason"} as press() does.
     """
     app, window = find_source(int(request["pid"]), request.get("window"))
     if window is None:
@@ -1103,20 +1225,37 @@ def click(request):
     pressed = press(request)
     if not pressed["ok"]:
         return pressed
-    navigated = wait_for(lambda: page_url(window) != before_url, CLICK_QUIET_SECONDS)
+    # A page that draws itself (GitHub) changes its address before what's on screen, so the address is checked
+    # often and the screen now and then: a change in place ends the wait early.
+    navigated, read = False, None
+    quiet = time.monotonic() + CLICK_QUIET_SECONDS
+    next_read = time.monotonic() + CLICK_SETTLE_SECONDS
+    while time.monotonic() < quiet:
+        if page_url(window) != before_url:
+            navigated = True
+            break
+        if time.monotonic() >= next_read:
+            read = read_screen(app, window)
+            if read["text"] != before_text:
+                break
+            next_read = time.monotonic() + CLICK_SETTLE_SECONDS
+        time.sleep(0.05)
     if navigated:
         wait_for(lambda: not page_loading(window), CLICK_LOAD_SECONDS)
-    return {"ok": True, "navigated": navigated, **settled_screen(app, window, before_text, navigated)}
+        read = None
+    return {"ok": True, "navigated": navigated, **settled_screen(app, window, before_text, navigated, read)}
 
 
-def settled_screen(app, window, before_text, navigated):
+def settled_screen(app, window, before_text, navigated, read=None):
     """Reads the screen until it settles: two reads in a row agree and, after a click that opened a page, it no
     longer shows what it showed before (a page that draws itself, like GitHub, changes its address first and
-    what's on screen a moment later). Returns the last read when it hasn't by CLICK_LOAD_SECONDS.
+    what's on screen a moment later). Starts from `read` when the caller has one. Returns the last read when it
+    hasn't settled by CLICK_LOAD_SECONDS.
     """
     deadline = time.monotonic() + (CLICK_LOAD_SECONDS if navigated else CLICK_QUIET_SECONDS)
-    time.sleep(CLICK_SETTLE_SECONDS)
-    read = read_screen(app, window)
+    if read is None:
+        time.sleep(CLICK_SETTLE_SECONDS)
+        read = read_screen(app, window)
     while time.monotonic() < deadline:
         time.sleep(CLICK_SETTLE_SECONDS)
         again = read_screen(app, window)
@@ -1130,7 +1269,7 @@ def find_source(pid, window_path):
     """The app with `pid` and its window an earlier read found (its child index), or the one showing a page
     when that index no longer leads to a window. (None, None) when the app is gone.
     """
-    app = next((a for a in children(Atspi.get_desktop(0)) if safe(a.get_process_id) == pid), None)
+    app = app_by_pid(pid)
     if app is None:
         return None, None
     window = app
@@ -1140,6 +1279,47 @@ def find_source(pid, window_path):
         showing = [w for w in children(app) if has_state(w, Atspi.StateType.SHOWING)]
         window = next((w for w in showing if find_document(w) is not None), showing[0] if showing else None)
     return app, window
+
+
+def find_window(request):
+    """Where AT-SPI has a desktop window the GNOME extension listed: by its app's pid, else by its title (a
+    flatpak registers under its xdg-dbus-proxy's pid, so the title is the fallback). {"ok": False} when it
+    shares nothing over AT-SPI.
+    """
+    pid = int(request.get("pid") or 0)
+    title = " ".join(str(request.get("title") or "").split())
+    candidates = []
+    for app in children(Atspi.get_desktop(0)):
+        app_pid = safe(app.get_process_id)
+        for index, window in enumerate(children(app)):
+            if safe(window.get_role) not in WINDOW_ROLES:
+                continue
+            name = " ".join((safe(window.get_name) or "").split())
+            score = 0
+            if pid and app_pid == pid:
+                score += 2
+            if title and name and (name == title or title.startswith(name) or name.startswith(title)):
+                score += 1
+            if score:
+                candidates.append((score, has_state(window, Atspi.StateType.SHOWING), app, window, index))
+    if not candidates:
+        return {"ok": False, "reason": "not_found"}
+    candidates.sort(key=lambda c: (-c[0], not c[1]))
+    _score, _showing, app, window, index = candidates[0]
+    document = find_document(window)
+    result = {
+        "ok": True,
+        "pid": safe(app.get_process_id),
+        "window": [index],
+        "toolkit": toolkit_of(app),
+        "source": "document" if document is not None else "window",
+        "appName": safe(app.get_name),
+        "windowTitle": safe(window.get_name),
+    }
+    url = document_url(document) if document is not None else None
+    if url:
+        result["url"] = url
+    return result
 
 
 def read_screen(app, window, max_chars=150_000, max_seconds=3):
@@ -1219,8 +1399,7 @@ def find_text(nodes, wanted):
 
 def top_of(node):
     """Where node's top is in its window now, or None."""
-    component = safe(node.get_component_iface)
-    extents = safe(lambda: Atspi.Component.get_extents(component, Atspi.CoordType.WINDOW)) if component else None
+    extents = extents_of(node)
     return (extents.x, extents.y) if extents is not None and extents.height > 0 else None
 
 
@@ -1298,7 +1477,7 @@ def docs_dialog(request):
     pid = int(request["pid"])
     deadline = time.monotonic() + float(request.get("wait", 2))
     while True:
-        app = next((a for a in children(Atspi.get_desktop(0)) if safe(a.get_process_id) == pid), None)
+        app = app_by_pid(pid)
         dialog = find_docs_dialog(app) if app is not None else None
         if dialog is not None:
             return {"ok": True, **dialog_parts(dialog)}
@@ -1435,10 +1614,21 @@ def main():
     parser.add_argument("--screen", metavar="JSON")
     parser.add_argument("--scroll", metavar="JSON")
     parser.add_argument("--docs-dialog", metavar="JSON")
+    parser.add_argument("--find-window", metavar="JSON")
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--text", action="store_true")
+    parser.add_argument("--source", metavar="JSON")
+    parser.add_argument("--wait", action="store_true")
     parser.add_argument("--delay", type=float, default=0)
     parser.add_argument("--max-chars", type=int, default=150_000)
     parser.add_argument("--max-seconds", type=float, default=0.8)
     args = parser.parse_args()
+    if args.wait:
+        # Python and its modules are loaded by now; AT-SPI connects with the first call, after this.
+        line = sys.stdin.readline()
+        if not line:
+            return
+        args = parser.parse_args(json.loads(line))
     if args.delay:
         time.sleep(args.delay)
     try:
@@ -1468,8 +1658,11 @@ def main():
             output = scroll(json.loads(args.scroll))
         elif args.docs_dialog:
             output = docs_dialog(json.loads(args.docs_dialog))
+        elif args.find_window:
+            output = find_window(json.loads(args.find_window))
         else:
-            output = capture_context(args.max_chars, args.max_seconds)
+            source = json.loads(args.source) if args.source else None
+            output = capture_context(args.max_chars, args.max_seconds, cursor=not args.text, page=not args.quick, source=source)
     except Exception as error:  # Report instead of crashing; the app falls back gracefully.
         output = {"ok": False, "error": f"{type(error).__name__}: {error}"}
     json.dump(output, sys.stdout)

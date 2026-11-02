@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Kiki browser harness</title>
+    <style>
+      body { font-family: sans-serif; max-width: 700px; margin: 24px auto; }
+      ol { line-height: 2.4; }
+      #cookie { position: fixed; top: 0; left: 0; right: 0; height: 44px; background: #eee; display: flex; gap: 8px; align-items: center; justify-content: center; }
+    </style>
+  </head>
+  <body>
+    <div id="cookie" role="dialog" aria-label="We use cookies">
+      <span>We use cookies to improve your experience.</span>
+      <button type="button" onclick="document.getElementById('cookie').remove()">Accept all</button>
+      <button type="button" onclick="document.getElementById('cookie').remove()">Reject all</button>
+    </div>
+    <p id="under-cookie" style="margin-top: 0">Under the notice: <a href="?page=covered">Covered link</a></p>
+    <h1>Kiki browser harness</h1>
+    <p id="first">This is the first paragraph, with a <a href="?page=second#top">Second page</a> link.</p>
+    <form id="search" onsubmit="event.preventDefault(); document.getElementById('result').textContent = 'Searched for: ' + this.q.value;">
+      <label>Search <input name="q" type="text" placeholder="Type here" /></label>
+      <button type="submit">Go</button>
+    </form>
+    <p id="result" aria-live="polite"></p>
+    <label><input id="agree" type="checkbox" /> I agree</label>
+    <label>Password <input id="secret" type="password" /></label>
+    <label>Colour
+      <select id="colour">
+        <option>Red</option>
+        <option>Green</option>
+        <option>Blue</option>
+      </select>
+    </label>
+    <p>
+      <button id="hello" type="button" onclick="window.helloCount = (window.helloCount || 0) + 1; document.getElementById('hello-out').textContent = 'Hello pressed: ' + window.helloCount; if (window.helloCount === 1) alert('Hi from the page');">Say hello</button>
+      <span id="hello-out"></span>
+    </p>
+    <p><a id="popup" href="#" onclick="window.open('?page=popup', '_blank'); return false;">Open in new window</a></p>
+    <p>
+      <button id="geo" type="button" onclick="navigator.geolocation.getCurrentPosition(() => (document.getElementById('geo-out').textContent = 'Location: granted'), () => (document.getElementById('geo-out').textContent = 'Location: denied'));">Where am I</button>
+      <span id="geo-out"></span>
+    </p>
+    <h2>Fixtures</h2>
+    <p><button id="nothing" type="button">Does nothing</button></p>
+    <p>
+      <button id="spa" type="button" onclick="history.pushState({}, '', '?route=about'); setTimeout(() => { document.getElementById('route').textContent = 'About route loaded'; }, 500);">Go to About (SPA)</button>
+      <span id="route"></span>
+    </p>
+    <p>
+      <button id="slow-results" type="button" onclick="setTimeout(() => { document.getElementById('results').textContent = 'Results: 3 items found'; }, 1500);">Search slowly</button>
+      <span id="results"></span>
+    </p>
+    <p>
+      <button id="fetching" type="button" onclick="fetch('/slow.json?delay=900').then((r) => r.json()).then((d) => { document.getElementById('fetched').textContent = 'Fetched: ' + d.value; });">Fetch slowly</button>
+      <span id="fetched"></span>
+    </p>
+    <p>
+      <button id="rerender" type="button" data-generation="0" onclick="const old = document.getElementById('rerender'); const fresh = old.cloneNode(true); fresh.dataset.generation = String(Number(old.dataset.generation) + 1); old.replaceWith(fresh); document.getElementById('rerender-out').textContent = 'Generation ' + fresh.dataset.generation;">Re-render me</button>
+      <span id="rerender-out"></span>
+    </p>
+    <h2>A long list</h2>
+    <ol id="list"></ol>
+    <script>
+      const params = new URLSearchParams(location.search);
+      if (params.get("page") === "second") document.title = "Second page";
+      if (params.get("page") === "covered") document.title = "Covered page";
+      if (params.get("page") === "popup") document.body.insertAdjacentHTML("afterbegin", "<p>Popup target</p>");
+      const list = document.getElementById("list");
+      for (let i = 1; i <= 60; i++) {
+        const item = document.createElement("li");
+        item.textContent = "Item " + i + ": some text to scroll past";
+        list.append(item);
+      }
+      // An endless feed: near the bottom, more items arrive a moment later (three times).
+      let batches = 0;
+      let loading = false;
+      addEventListener("scroll", () => {
+        if (batches >= 3 || loading) return;
+        if (innerHeight + scrollY < document.documentElement.scrollHeight - 300) return;
+        loading = true;
+        setTimeout(() => {
+          const from = list.children.length;
+          for (let i = from + 1; i <= from + 20; i++) {
+            const item = document.createElement("li");
+            item.textContent = "Item " + i + ": loaded later";
+            list.append(item);
+          }
+          batches++;
+          loading = false;
+        }, 500);
+      });
+    </script>
+  </body>
+</html>

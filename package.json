@@ -4,16 +4,14 @@
   "type": "module",
   "workspaces": [
     "shared",
-    "server",
+    "engine",
     "desktop"
   ],
   "scripts": {
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
-    "dev:server": "npm run dev -w server",
-    "dev:desktop": "npm run dev -w desktop",
-    "codes": "npm run codes -w server --",
-    "mock": "npm run mock -w server"
+    "dev": "npm run dev -w desktop",
+    "smoke": "npm run smoke -w engine --"
   },
   "devDependencies": {
     "@types/node": "^22.19.0",

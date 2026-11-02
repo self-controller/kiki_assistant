@@ -3,6 +3,7 @@
 import type { FieldValue, FormField, ProposedAction, TextChange } from "@kiki/shared";
 import type { ActionMode, ActionRunResult, ActionStatus, EditInfo, SavedAction } from "../shared-types.ts";
 import { diffParts } from "./diff.ts";
+import { clip, el } from "./dom.ts";
 import { icon, type IconName } from "./icons.ts";
 
 export interface CardOptions {
@@ -18,12 +19,6 @@ export interface CardOptions {
   onChange(): void;
 }
 
-function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, text?: string) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
 
 const KINDS: Record<ProposedAction["kind"], { label: string; icon: IconName }> = {
   event: { label: "Calendar event", icon: "calendar" },
@@ -344,7 +339,8 @@ const pressLabel = (count: number) => (count === 1 ? "Press" : `Press ${count}`)
 
 function statusLine(status: ActionStatus): HTMLElement {
   const line = el("div", `card-status ${status.outcome}`);
-  if (status.outcome !== "failed" && status.outcome !== "dismissed") line.append(icon("check", 13, 2.5));
+  if (status.outcome === "undone") line.append(icon("undo", 13, 2.5));
+  else if (status.outcome !== "failed" && status.outcome !== "dismissed") line.append(icon("check", 13, 2.5));
   line.append(el("span", undefined, status.message));
   if (status.link) {
     const link = el("a", undefined, "Open");
@@ -366,6 +362,7 @@ export function renderActionCard(saved: SavedAction, options: CardOptions): HTML
   if (finished) {
     root.classList.add("finished");
     root.append(el("div", "card-title", titleOf(saved.action, options.fields)), statusLine(saved.status!));
+    if (saved.undoable) root.append(undoRow(saved, options, root));
     return root;
   }
 
@@ -426,6 +423,35 @@ export function renderActionCard(saved: SavedAction, options: CardOptions): HTML
   return root;
 }
 
+/** An applied card's Undo button, with a line for why it couldn't when it couldn't. */
+function undoRow(saved: SavedAction, options: CardOptions, root: HTMLElement): HTMLElement {
+  const row = el("div", "card-undo");
+  const actions = el("div", "card-actions");
+  const error = el("div", "card-status failed");
+  error.hidden = true;
+  const button = el("button", "quiet undo");
+  button.type = "button";
+  button.title = "Put back what this card changed";
+  button.append(icon("undo", 13, 2.5), el("span", undefined, "Undo"));
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    const result = await options.run(saved.action.id, saved.action, "undo").catch(
+      (failure: unknown): ActionRunResult => ({ ok: false, message: String(failure) }),
+    );
+    if (result.ok) {
+      root.replaceWith(renderActionCard(result.saved, options));
+    } else {
+      button.disabled = false;
+      error.textContent = result.message;
+      error.hidden = false;
+    }
+    options.onChange();
+  });
+  actions.append(button);
+  row.append(actions, error);
+  return row;
+}
+
 function titleOf(action: ProposedAction, fields: FormField[] | undefined): string {
   switch (action.kind) {
     case "event": {
@@ -436,10 +462,8 @@ function titleOf(action: ProposedAction, fields: FormField[] | undefined): strin
       return action.due ? `${action.title} · due ${action.due}` : action.title;
     case "email":
       return `${action.subject || "(no subject)"} → ${action.to.join(", ") || "no recipient"}`;
-    case "edit": {
-      const line = action.text.trim().split("\n")[0] ?? "";
-      return line.length > 80 ? `${line.slice(0, 80)}…` : line;
-    }
+    case "edit":
+      return clip(action.text.trim().split("\n")[0] ?? "", 80);
     case "changes": {
       const first = diffParts(action.changes[0]!.find, action.changes[0]!.replace);
       const more = action.changes.length > 1 ? ` and ${action.changes.length - 1} more` : "";

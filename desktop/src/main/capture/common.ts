@@ -13,11 +13,20 @@ export interface Vicinity {
   after: string;
 }
 
-/** A page's text, and where in it the window is scrolled to. */
-export interface PageText {
+/** What the full read of a window adds once the popup is open: its text, and what's found on the way. */
+export interface LateText {
   text: string;
   /** Offset in `text` of the middle of what's on screen, when some of the page is off screen. */
   focus?: number;
+  /**
+   * What's highlighted in the page, when the quick read didn't find it at the cursor. Empty: nothing is, so the
+   * primary selection Kiki had was from another window.
+   */
+  selection?: string;
+  /** The page's form, when the quick read didn't get that far. */
+  form?: FormTarget;
+  /** Terminal or editor lines an app's own reader found (kitty, WezTerm, VS Code's file), instead of `text`. */
+  vicinity?: Vicinity;
 }
 
 /** An AT-SPI text object that takes writes directly, as the Linux helper found it (see its --edit). */
@@ -68,6 +77,8 @@ export interface FieldTarget extends FormField {
   role?: string;
   /** The field's text is longer than `value`, which is cut short. */
   length?: number;
+  /** A password field: `act` never types into it; a fill card may, once the person approves. */
+  password?: boolean;
 }
 
 /** The fields on the page (or in the window) the hotkey was pressed in, and how to fill them. */
@@ -106,10 +117,10 @@ export interface Capture {
   /** Text around the selection (or what's on screen), trimmed to CONTEXT_CHARS. */
   text?: string;
   /**
-   * The whole text, when reading `text` ran out of time or failed; read alongside it and settles after the
-   * popup opens.
+   * The window's text (trimmed like `text`), when the quick read left it for later or failed; read alongside
+   * it, it settles after the popup opens.
    */
-  fullText?: Promise<string | undefined>;
+  fullText?: Promise<Omit<LateText, "focus"> | undefined>;
   screenshot?: Screenshot;
   /** Takes a screenshot of the same window later, once the popup is open, where the platform can. */
   takeScreenshot?: () => Promise<Screenshot | undefined>;
@@ -119,17 +130,19 @@ export interface Capture {
   form?: FormTarget;
   /** The window itself, for scrolling it and reading what's on screen later. */
   source?: SourceWindow;
+  /** Kiki's GNOME extension's version when the capture was taken (Linux); 0 when it isn't running. */
+  helperVersion?: number;
   /** Hints for the user, e.g. how to give Kiki more context. */
   notes: string[];
 }
 
 /** What a platform reads, before captureContext trims it into a Capture. */
 export interface RawCapture extends Omit<Capture, "fullText"> {
-  /** Where `text` is scrolled to; see PageText. */
+  /** Where `text` is scrolled to; see LateText. */
   focus?: number;
   /** Terminal or editor text around the selection, trimmed to whole lines instead of `text`. */
   vicinity?: Vicinity;
-  fullText?: Promise<PageText | undefined>;
+  fullText?: Promise<LateText | undefined>;
 }
 
 /** How much nearby text to send: enough to place the selection, not the whole page. */

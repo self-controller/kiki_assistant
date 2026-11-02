@@ -9,6 +9,13 @@
 // Ctrl+H for Google Docs' Find and replace. ScrollSource scrolls it with a virtual mouse wheel, without taking
 // the focus from Kiki, for Kiki's scroll tool. SetClipboard puts text on the clipboard for those pastes: GNOME
 // drops a clipboard write from an app without the keyboard, and Kiki hands the keyboard to that window.
+// ActivatePopup gives the open popup the keyboard again, when the hotkey brings a new highlight into it.
+// SourceApp says which app the remembered window belongs to, for apps that share nothing over accessibility.
+// KeysToSource also presses Ctrl+Z, and Backspace many times over, for Kiki's Undo button (v12).
+// Version 13: ListWindows and SelectSource let Kiki work in another window than the hotkey's; ListApps and
+// LaunchApp start apps; ClickAt, DragPath and KeyChord click, drag and press key chords in the source window
+// (raising it first when something covers the spot); ShowBanner and HideBanner show "Kiki is using your
+// computer" with a Stop button, and Esc stops too (see banner.js).
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -20,13 +27,14 @@ import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
+import {Banner} from './banner.js';
 import {cropAround} from './crop.js';
 import {insideHitRect, popupGeometry} from './placement.js';
 import {inside, scrollPoint} from './scroll.js';
 
 Gio._promisify(Shell.Screenshot, 'composite_to_stream');
 
-const VERSION = 9;
+const VERSION = 13;
 const OBJECT_PATH = '/app/kiki/Shell';
 /** How long after PlacePopup the next window from that process counts as the popup. */
 const EXPECT_US = 5 * GLib.USEC_PER_SEC;
@@ -46,6 +54,11 @@ const INTERFACE = `<node>
       <arg type="u" direction="out" name="version"/>
       <arg type="b" direction="out" name="moving"/>
     </method>
+    <method name="ActivatePopup">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="u" direction="out" name="version"/>
+      <arg type="b" direction="out" name="found"/>
+    </method>
     <method name="SetHitRect">
       <arg type="u" direction="in" name="pid"/>
       <arg type="i" direction="in" name="x"/>
@@ -58,6 +71,10 @@ const INTERFACE = `<node>
     <method name="RememberSource">
       <arg type="u" direction="out" name="version"/>
       <arg type="b" direction="out" name="found"/>
+    </method>
+    <method name="SourceApp">
+      <arg type="u" direction="out" name="version"/>
+      <arg type="s" direction="out" name="app"/>
     </method>
     <method name="CaptureSource">
       <arg type="i" direction="in" name="maxWidth"/>
@@ -89,6 +106,51 @@ const INTERFACE = `<node>
       <arg type="i" direction="in" name="pixels"/>
       <arg type="u" direction="out" name="version"/>
       <arg type="s" direction="out" name="outcome"/>
+    </method>
+    <method name="ListWindows">
+      <arg type="u" direction="out" name="version"/>
+      <arg type="s" direction="out" name="windows"/>
+    </method>
+    <method name="SelectSource">
+      <arg type="s" direction="in" name="id"/>
+      <arg type="u" direction="out" name="version"/>
+      <arg type="b" direction="out" name="found"/>
+    </method>
+    <method name="ListApps">
+      <arg type="u" direction="out" name="version"/>
+      <arg type="s" direction="out" name="apps"/>
+    </method>
+    <method name="LaunchApp">
+      <arg type="s" direction="in" name="id"/>
+      <arg type="u" direction="out" name="version"/>
+      <arg type="b" direction="out" name="started"/>
+    </method>
+    <method name="ClickAt">
+      <arg type="d" direction="in" name="x"/>
+      <arg type="d" direction="in" name="y"/>
+      <arg type="s" direction="in" name="button"/>
+      <arg type="i" direction="in" name="count"/>
+      <arg type="u" direction="out" name="version"/>
+      <arg type="s" direction="out" name="outcome"/>
+    </method>
+    <method name="DragPath">
+      <arg type="ad" direction="in" name="points"/>
+      <arg type="u" direction="out" name="version"/>
+      <arg type="s" direction="out" name="outcome"/>
+    </method>
+    <method name="KeyChord">
+      <arg type="s" direction="in" name="chord"/>
+      <arg type="u" direction="out" name="version"/>
+      <arg type="b" direction="out" name="done"/>
+    </method>
+    <method name="ShowBanner">
+      <arg type="s" direction="in" name="text"/>
+      <arg type="u" direction="out" name="version"/>
+      <arg type="b" direction="out" name="shown"/>
+    </method>
+    <method name="HideBanner">
+      <arg type="u" direction="out" name="version"/>
+      <arg type="b" direction="out" name="hidden"/>
     </method>
     <method name="Version">
       <arg type="u" direction="out" name="version"/>
@@ -126,7 +188,8 @@ const MAX_SCROLL_PX = 20000;
 
 /**
  * The shortcuts KeysToSource presses, by name. Only these: whatever calls it can't type text, which goes
- * through the clipboard and a paste instead.
+ * through the clipboard and a paste instead. A step may also be 'backspace*N' (N up to MAX_REPEAT): Backspace
+ * pressed N times, quickly, which takes back text Kiki pasted at a terminal's prompt.
  */
 const KEY_STEPS = {
     'ctrl+a': [Clutter.KEY_Control_L, Clutter.KEY_a],
@@ -134,11 +197,101 @@ const KEY_STEPS = {
     'ctrl+h': [Clutter.KEY_Control_L, Clutter.KEY_h],
     'ctrl+v': [Clutter.KEY_Control_L, Clutter.KEY_v],
     'ctrl+shift+v': [Clutter.KEY_Control_L, Clutter.KEY_Shift_L, Clutter.KEY_v],
+    'ctrl+z': [Clutter.KEY_Control_L, Clutter.KEY_z],
     'backspace': [Clutter.KEY_BackSpace],
     'escape': [Clutter.KEY_Escape],
     'enter': [Clutter.KEY_Return],
     'tab': [Clutter.KEY_Tab],
 };
+const REPEAT_STEP = /^backspace\*(\d{1,4})$/;
+const MAX_REPEAT = 2000;
+
+/** The keys KeyChord presses, by name, with ctrl, alt and shift. Letters and digits too; never text. */
+const CHORD_KEYS = {
+    enter: Clutter.KEY_Return,
+    return: Clutter.KEY_Return,
+    tab: Clutter.KEY_Tab,
+    escape: Clutter.KEY_Escape,
+    esc: Clutter.KEY_Escape,
+    backspace: Clutter.KEY_BackSpace,
+    delete: Clutter.KEY_Delete,
+    up: Clutter.KEY_Up,
+    down: Clutter.KEY_Down,
+    left: Clutter.KEY_Left,
+    right: Clutter.KEY_Right,
+    home: Clutter.KEY_Home,
+    end: Clutter.KEY_End,
+    pageup: Clutter.KEY_Page_Up,
+    pagedown: Clutter.KEY_Page_Down,
+    space: Clutter.KEY_space,
+    f1: Clutter.KEY_F1,
+    f2: Clutter.KEY_F2,
+    f3: Clutter.KEY_F3,
+    f4: Clutter.KEY_F4,
+    f5: Clutter.KEY_F5,
+    f6: Clutter.KEY_F6,
+    f7: Clutter.KEY_F7,
+    f8: Clutter.KEY_F8,
+    f9: Clutter.KEY_F9,
+    f10: Clutter.KEY_F10,
+    f11: Clutter.KEY_F11,
+    f12: Clutter.KEY_F12,
+};
+const CHORD_MODIFIERS = {
+    ctrl: Clutter.KEY_Control_L,
+    control: Clutter.KEY_Control_L,
+    alt: Clutter.KEY_Alt_L,
+    shift: Clutter.KEY_Shift_L,
+    super: Clutter.KEY_Super_L,
+};
+
+/** The keysyms of a chord like "ctrl+shift+a" or "pageup", modifiers first; null for anything else. */
+function parseChord(chord) {
+    const parts = String(chord).toLowerCase().split('+').map(part => part.trim()).filter(Boolean);
+    if (parts.length === 0 || parts.length > 4)
+        return null;
+    const keys = [];
+    for (const part of parts.slice(0, -1)) {
+        if (!Object.hasOwn(CHORD_MODIFIERS, part))
+            return null;
+        keys.push(CHORD_MODIFIERS[part]);
+    }
+    const last = parts.at(-1);
+    if (Object.hasOwn(CHORD_KEYS, last))
+        keys.push(CHORD_KEYS[last]);
+    else if (/^[a-z0-9]$/.test(last))
+        keys.push(Clutter.unicode_to_keysym(last.codePointAt(0)));
+    else
+        return null;
+    return keys;
+}
+
+const BUTTONS = {
+    left: Clutter.BUTTON_PRIMARY,
+    middle: Clutter.BUTTON_MIDDLE,
+    right: Clutter.BUTTON_SECONDARY,
+};
+/** Between a button's press and release, between clicks of a double click, and between the drag's steps. */
+const CLICK_HOLD_MS = 40;
+const CLICK_GAP_MS = 80;
+const DRAG_STEP_MS = 12;
+const DRAG_STEPS = 12;
+/** How long ClickAt waits for a raised window to come to the top. */
+const RAISE_WAIT_MS = 600;
+/** The most windows ListWindows reports. */
+const MAX_WINDOWS = 60;
+/** Between the presses of a repeated key, and how many of them go by between checks that the window still has the keyboard. */
+const REPEAT_GAP_MS = 3;
+const REPEAT_CHECK_EVERY = 50;
+
+/** The keys a step presses: a named shortcut, or [keys, count] for a repeated one. Null for a step Kiki doesn't press. */
+function parseStep(step) {
+    if (Object.hasOwn(KEY_STEPS, step))
+        return {keys: KEY_STEPS[step], count: 1};
+    const repeat = REPEAT_STEP.exec(step);
+    const count = repeat ? Number(repeat[1]) : 0;
+    return count >= 1 && count <= MAX_REPEAT ? {keys: KEY_STEPS['backspace'], count} : null;
+}
 
 const sleep = ms => new Promise(resolve => {
     GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
@@ -273,21 +426,36 @@ export default class KikiExtension extends Extension {
         this._service = Gio.DBusExportedObject.wrapJSObject(INTERFACE, {
             PlacePopup: (pid, cardHeight) => this._place(pid, cardHeight),
             MovePopup: pid => [VERSION, this._move(pid)],
+            ActivatePopup: pid => [VERSION, this._activate(pid)],
             SetHitRect: (pid, x, y, width, height) => [VERSION, this._setHitRect(pid, {x, y, width, height})],
             RememberSource: () => [VERSION, this._rememberSource()],
+            SourceApp: () => [VERSION, this._sourceApp()],
             CaptureSourceAsync: (params, invocation) => this._captureSource(params, invocation),
             PasteToSourceAsync: (params, invocation) => this._pasteToSource(params, invocation),
             FocusSourceAsync: (params, invocation) => this._reply(invocation, () => this._focusSource()),
             KeysToSourceAsync: ([steps], invocation) => this._reply(invocation, () => this._keysToSource(steps)),
             ScrollSourceAsync: (params, invocation) => this._scrollSourceCall(params, invocation),
             SetClipboard: text => [VERSION, this._setClipboard(text)],
+            ListWindows: () => [VERSION, this._listWindows()],
+            SelectSource: id => [VERSION, this._selectSource(id)],
+            ListApps: () => [VERSION, this._listApps()],
+            LaunchApp: id => [VERSION, this._launchApp(id)],
+            ClickAtAsync: (params, invocation) => this._outcomeCall(invocation, () => this._clickAt(...params)),
+            DragPathAsync: ([points], invocation) => this._outcomeCall(invocation, () => this._dragPath(points)),
+            KeyChordAsync: ([chord], invocation) => this._reply(invocation, () => this._keyChord(chord)),
+            ShowBanner: text => [VERSION, this._banner.show(text)],
+            HideBanner: () => [VERSION, this._banner.hide()],
             Version: () => VERSION,
         });
         this._service.export(Gio.DBus.session, OBJECT_PATH);
         global.display.connectObject('window-created', (_display, window) => this._windowCreated(window), this);
+        this._cancelled = false;
+        this._banner = new Banner(() => (this._cancelled = true));
     }
 
     disable() {
+        this._banner?.destroy();
+        this._banner = null;
         this._stopTracking();
         this._forgetSource();
         this._keyboard?.run_dispose();
@@ -336,6 +504,19 @@ export default class KikiExtension extends Extension {
             const pointer = Clutter.get_default_backend().get_default_seat().get_pointer();
             return popup.window.begin_grab_op(op, pointer, null, time, null);
         }
+    }
+
+    /**
+     * Gives the open popup the keyboard again: the hotkey, pressed while it's open over another window, brings
+     * the new highlight into its chat. GNOME doesn't let an app focus its own window once it has lost focus.
+     */
+    _activate(pid) {
+        const popup = [...this._popups].find(p => p.window.get_pid() === pid);
+        if (!popup)
+            return false;
+        popup.window.make_above();
+        Main.activateWindow(popup.window);
+        return true;
     }
 
     _setHitRect(pid, rect) {
@@ -390,9 +571,249 @@ export default class KikiExtension extends Extension {
         return true;
     }
 
+    /**
+     * The app the remembered window belongs to, as JSON: its desktop id ("google-chrome.desktop"), name, WM
+     * class, flatpak id, title and process. "{}" when there's no remembered window.
+     */
+    _sourceApp() {
+        const window = this._source?.window;
+        if (!window)
+            return '{}';
+        const app = Shell.WindowTracker.get_default().get_window_app(window);
+        return JSON.stringify({
+            id: app?.get_id() ?? '',
+            name: app?.get_name() ?? '',
+            wmClass: window.get_wm_class() ?? '',
+            sandboxedId: window.get_sandboxed_app_id() ?? '',
+            title: window.get_title() ?? '',
+            pid: window.get_pid(),
+        });
+    }
+
     _forgetSource() {
         this._source?.window.disconnectObject(this);
         this._source = null;
+    }
+
+    /** The windows on the desktop (normal ones), top of the stack first, as JSON. */
+    _listWindows() {
+        const workspace = global.workspace_manager.get_active_workspace();
+        const focus = global.display.focus_window;
+        const tracker = Shell.WindowTracker.get_default();
+        const windows = global.get_window_actors()
+            .map(actor => actor.meta_window)
+            .filter(window => window && window.get_window_type() === Meta.WindowType.NORMAL);
+        const sorted = global.display.sort_windows_by_stacking(windows).reverse().slice(0, MAX_WINDOWS);
+        return JSON.stringify(sorted.map(window => {
+            const app = tracker.get_window_app(window);
+            const frame = window.get_frame_rect();
+            return {
+                id: String(window.get_id()),
+                pid: window.get_pid(),
+                app: app?.get_id() ?? '',
+                name: app?.get_name() ?? '',
+                wmClass: window.get_wm_class() ?? '',
+                sandboxedId: window.get_sandboxed_app_id() ?? '',
+                title: window.get_title() ?? '',
+                focused: window === focus,
+                minimized: window.minimized,
+                onWorkspace: window.located_on_workspace(workspace),
+                kiki: [...this._popups].some(popup => popup.window === window),
+                source: this._source?.window === window && !this._source.selected,
+                x: frame.x,
+                y: frame.y,
+                width: frame.width,
+                height: frame.height,
+            };
+        }));
+    }
+
+    /** Makes the window with `id` (from ListWindows) the source, as RememberSource does for the focused one. */
+    _selectSource(id) {
+        const window = global.get_window_actors()
+            .map(actor => actor.meta_window)
+            .find(candidate => candidate && String(candidate.get_id()) === String(id));
+        if (!window || window.get_window_type() !== Meta.WindowType.NORMAL)
+            return false;
+        this._forgetSource();
+        const frame = window.get_frame_rect();
+        this._source = {
+            window,
+            pointer: {x: frame.x + Math.round(frame.width / 2), y: frame.y + Math.round(frame.height / 2)},
+            selected: true,
+        };
+        window.connectObject('unmanaging', () => this._forgetSource(), this);
+        return true;
+    }
+
+    /** The installed apps that show in the app grid, as JSON [{id, name}]. */
+    _listApps() {
+        const apps = Shell.AppSystem.get_default().get_installed()
+            .filter(info => info.should_show())
+            .map(info => ({id: info.get_id(), name: info.get_name()}));
+        return JSON.stringify(apps);
+    }
+
+    /** Starts the app with desktop id `id`, or brings it up when it's running. */
+    _launchApp(id) {
+        const app = Shell.AppSystem.get_default().lookup_app(String(id));
+        if (!app)
+            return false;
+        app.activate();
+        return true;
+    }
+
+    /** Answers a D-Bus call with (version, outcome), or with its error. */
+    async _outcomeCall(invocation, run) {
+        try {
+            const outcome = await run();
+            invocation.return_value(new GLib.Variant('(us)', [VERSION, outcome]));
+        } catch (e) {
+            invocation.return_dbus_error('org.freedesktop.DBus.Error.Failed', `${e}`);
+        }
+    }
+
+    /**
+     * The source window, ready for the pointer: raised when something covers `spot` (a point in it). Returns
+     * the window, or why not ("gone", "hidden", "busy", "covered").
+     */
+    async _pointerTarget(spot) {
+        const window = this._source?.window;
+        if (!window)
+            return 'gone';
+        const workspace = global.workspace_manager.get_active_workspace();
+        if (window.minimized || !window.located_on_workspace(workspace))
+            return 'hidden';
+        if (Main.overview.visible || Main.modalCount > 0)
+            return 'busy';
+        if (this._reaches(window, spot))
+            return window;
+        // Something else is over that spot: bring the window to the front and wait for it.
+        Main.activateWindow(window);
+        for (let waited = 0; waited < RAISE_WAIT_MS; waited += 20) {
+            await sleep(20);
+            if (this._source?.window !== window)
+                return 'gone';
+            if (this._reaches(window, spot))
+                return window;
+        }
+        return 'covered';
+    }
+
+    /** Where a fraction (0 to 1) of the window's width and height is on the stage. */
+    _spotIn(window, x, y) {
+        const frame = rectOf(window.get_frame_rect());
+        const clamp = value => Math.min(1, Math.max(0, Number(value) || 0));
+        return {
+            x: frame.x + Math.round(clamp(x) * (frame.width - 1)),
+            y: frame.y + Math.round(clamp(y) * (frame.height - 1)),
+        };
+    }
+
+    /** Runs `act` with the hidden virtual pointer at `spot`, then puts the pointer back where it was. */
+    async _withPointer(spot, act) {
+        this._pointer ??= Clutter.get_default_backend().get_default_seat()
+            .create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
+        const [startX, startY] = global.get_pointer();
+        const tracker = global.backend?.get_cursor_tracker?.();
+        const visible = tracker?.get_pointer_visible?.() ?? true;
+        try {
+            tracker?.set_pointer_visible?.(false);
+            this._pointer.notify_absolute_motion(GLib.get_monotonic_time(), spot.x, spot.y);
+            this._updatePopups();
+            await sleep(POINTER_SETTLE_MS);
+            return await act(this._pointer);
+        } finally {
+            const [x, y] = global.get_pointer();
+            // Back where it was. Not to the screen's corner, where the pointer is before anyone has moved it:
+            // that's the Activities hot corner, and putting the pointer there opens the overview.
+            const corner = startX === 0 && startY === 0;
+            if (!corner && (Math.abs(x - startX) > 1 || Math.abs(y - startY) > 1))
+                this._pointer.notify_absolute_motion(GLib.get_monotonic_time(), startX, startY);
+            tracker?.set_pointer_visible?.(visible);
+            this._updatePopups();
+        }
+    }
+
+    /**
+     * Clicks in the source window at (`x`, `y`), fractions of its size, `count` times with `button`. The
+     * window is raised first when something covers that spot, so the click reaches it.
+     */
+    async _clickAt(x, y, button, count) {
+        const code = BUTTONS[String(button)] ?? Clutter.BUTTON_PRIMARY;
+        const clicks = Math.min(3, Math.max(1, Number(count) || 1));
+        const window = this._source?.window;
+        if (!window)
+            return 'gone';
+        const spot = this._spotIn(window, x, y);
+        const target = await this._pointerTarget(spot);
+        if (typeof target === 'string')
+            return target;
+        this._cancelled = false;
+        return this._withPointer(spot, async pointer => {
+            for (let done = 0; done < clicks; done++) {
+                if (this._cancelled)
+                    return 'cancelled';
+                if (done > 0)
+                    await sleep(CLICK_GAP_MS);
+                pointer.notify_button(GLib.get_monotonic_time(), code, Clutter.ButtonState.PRESSED);
+                await sleep(CLICK_HOLD_MS);
+                pointer.notify_button(GLib.get_monotonic_time(), code, Clutter.ButtonState.RELEASED);
+            }
+            return 'done';
+        });
+    }
+
+    /** Drags with the left button through `points` ([x1, y1, x2, y2, ...], fractions of the source window). */
+    async _dragPath(points) {
+        const values = Array.from(points ?? []).map(Number);
+        if (values.length < 4 || values.length % 2 !== 0 || values.length > 40)
+            throw new Error('DragPath takes two or more points');
+        const window = this._source?.window;
+        if (!window)
+            return 'gone';
+        const spots = [];
+        for (let i = 0; i < values.length; i += 2)
+            spots.push(this._spotIn(window, values[i], values[i + 1]));
+        const target = await this._pointerTarget(spots[0]);
+        if (typeof target === 'string')
+            return target;
+        this._cancelled = false;
+        return this._withPointer(spots[0], async pointer => {
+            pointer.notify_button(GLib.get_monotonic_time(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED);
+            await sleep(CLICK_HOLD_MS);
+            try {
+                for (let i = 1; i < spots.length; i++) {
+                    const from = spots[i - 1];
+                    const to = spots[i];
+                    for (let step = 1; step <= DRAG_STEPS; step++) {
+                        if (this._cancelled)
+                            return 'cancelled';
+                        const t = step / DRAG_STEPS;
+                        pointer.notify_absolute_motion(
+                            GLib.get_monotonic_time(),
+                            Math.round(from.x + (to.x - from.x) * t),
+                            Math.round(from.y + (to.y - from.y) * t));
+                        await sleep(DRAG_STEP_MS);
+                    }
+                }
+                await sleep(CLICK_HOLD_MS);
+            } finally {
+                pointer.notify_button(GLib.get_monotonic_time(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED);
+            }
+            return 'done';
+        });
+    }
+
+    /** Focuses the source window and presses one key chord there ("enter", "ctrl+a", "pageup"). */
+    async _keyChord(chord) {
+        const keys = parseChord(chord);
+        if (!keys)
+            throw new Error(`Kiki doesn't press "${chord}"`);
+        if (!await this._focusSource())
+            return false;
+        await this._press(keys);
+        return true;
     }
 
     async _pasteToSource([terminal], invocation) {
@@ -422,18 +843,29 @@ export default class KikiExtension extends Extension {
 
     /** Presses the named shortcuts in the remembered window, one after another. False if it won't take focus. */
     async _keysToSource(steps) {
-        const unknown = steps.find(step => !Object.hasOwn(KEY_STEPS, step));
-        if (unknown !== undefined)
-            throw new Error(`Kiki doesn't press "${unknown}"`);
+        const parsed = steps.map(parseStep);
+        const unknown = parsed.indexOf(null);
+        if (unknown >= 0)
+            throw new Error(`Kiki doesn't press "${steps[unknown]}"`);
         if (!await this._focusSource())
             return false;
-        for (const [index, step] of steps.entries()) {
+        for (const [index, {keys, count}] of parsed.entries()) {
             if (index > 0)
                 await sleep(STEP_GAP_MS);
             // Focus can move (another window, the overview) while the app works: stop rather than type elsewhere.
             if (!this._sourceReady(this._source?.window))
                 return false;
-            await this._press(KEY_STEPS[step]);
+            if (count === 1) {
+                await this._press(keys);
+                continue;
+            }
+            for (let done = 0; done < count; done++) {
+                if (this._cancelled)
+                    return false;
+                if (done > 0 && done % REPEAT_CHECK_EVERY === 0 && !this._sourceReady(this._source?.window))
+                    return false;
+                await this._press(keys, REPEAT_GAP_MS);
+            }
         }
         return true;
     }
@@ -470,14 +902,14 @@ export default class KikiExtension extends Extension {
         return this._sourceReady(window);
     }
 
-    /** Presses `keys` together, in order, and lets them go in reverse. */
-    async _press(keys) {
+    /** Presses `keys` together, in order, and lets them go in reverse, `gap` ms apart. */
+    async _press(keys, gap = KEY_GAP_MS) {
         this._keyboard ??= Clutter.get_default_backend().get_default_seat()
             .create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
         for (const [state, order] of [[Clutter.KeyState.PRESSED, keys], [Clutter.KeyState.RELEASED, [...keys].reverse()]]) {
             for (const key of order) {
                 this._keyboard.notify_keyval(GLib.get_monotonic_time(), key, state);
-                await sleep(KEY_GAP_MS);
+                await sleep(gap);
             }
         }
     }
@@ -536,6 +968,8 @@ export default class KikiExtension extends Extension {
             this._updatePopups();
             await sleep(POINTER_SETTLE_MS);
             for (let left = total; left !== 0;) {
+                if (this._cancelled)
+                    break;
                 const piece = Math.sign(left) * Math.min(Math.abs(left), SCROLL_PIECE_PX);
                 this._pointer.notify_scroll_continuous(
                     GLib.get_monotonic_time(), 0, piece / PIXELS_PER_SCROLL,

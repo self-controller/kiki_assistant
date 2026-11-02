@@ -2,6 +2,7 @@
 // connected, or by opening a prefilled Google page in the browser when it isn't.
 import type { ActionOutcome, ProposedAction, ReadToolName, ToolResult } from "@kiki/shared";
 import type { ActionMode, ActionStatus } from "../shared-types.ts";
+import { errorMessage } from "./errors.ts";
 import { createDraft, createEvent, createTask, listEvents, listTasks, sendEmail } from "./google/api.ts";
 import { calendarTemplateUrl, describeAction, gmailComposeUrl } from "./google/format.ts";
 import { googleAccount } from "./google/oauth.ts";
@@ -11,9 +12,6 @@ function timeZone(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
 
 /**
  * The cards that go to Google (or open a Google page); edit cards run in edit.ts, changes and fills in

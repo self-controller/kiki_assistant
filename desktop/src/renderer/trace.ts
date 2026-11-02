@@ -1,12 +1,13 @@
 // The "Thinking…" feed above an answer: what Kiki thinks, searches, reads, opens, scrolls and clicks while it works,
 // collapsing to one line ("Thought for 6s · 2 searches · 5 sources") once the answer starts.
 import type { Activity, Source } from "@kiki/shared";
+import { el } from "./dom.ts";
 import { formatSeconds, hostOf, paragraphs, plural, thoughtLine } from "./feed.ts";
 import { icon, type IconName } from "./icons.ts";
 import { SwapText } from "./textfx.ts";
 
 /** What Kiki is doing right now, as the feed's title says it. */
-export type TracePhase = "thinking" | "searching" | "reading" | "scrolling" | "clicking";
+export type TracePhase = "thinking" | "searching" | "reading" | "scrolling" | "clicking" | "browsing" | "acting";
 
 const PHASE_TITLES: Record<TracePhase, string> = {
   thinking: "Thinking…",
@@ -14,6 +15,8 @@ const PHASE_TITLES: Record<TracePhase, string> = {
   reading: "Reading…",
   scrolling: "Scrolling…",
   clicking: "Clicking…",
+  browsing: "Browsing…",
+  acting: "Working…",
 };
 
 /** The icon for a lookup or check line, by what it checks. */
@@ -28,13 +31,6 @@ function lookupIcon(label: string): IconName {
 /** Feed lines shown while Kiki works; older ones fold into "+N earlier". */
 const VISIBLE_LINES = 5;
 
-function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, text?: string) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
-
 export class Trace {
   readonly root = el("div", "trace live");
   readonly #head = el("button", "trace-head");
@@ -47,14 +43,16 @@ export class Trace {
   #timer: number;
   /** Feed lines in order; a thought line follows one paragraph of the thinking text. */
   readonly #lines: Array<{ node: HTMLLIElement; paragraph?: number }> = [];
+  /** The thought lines' text, one per paragraph of the thinking so far. */
+  readonly #thoughts: HTMLElement[] = [];
   readonly #reads = new Map<string, HTMLLIElement>();
   readonly #queries = new Set<string>();
   readonly #hosts = new Set<string>();
-  /** Scrolls of the person's window and clicks in it, for the summary. */
+  /** Scrolls of the person's window, clicks and acts in it, and pages opened, for the summary. */
   #scrolls = 0;
   #clicks = 0;
+  #pages = 0;
   #thinking = "";
-  #paragraphs = 0;
   #frame = 0;
   #finished = false;
 
@@ -101,6 +99,7 @@ export class Trace {
       this.#frame = requestAnimationFrame(() => {
         this.#frame = 0;
         this.#renderThoughts();
+        this.onChange();
       });
     }
   }
@@ -121,7 +120,6 @@ export class Trace {
       case "lookup": {
         const line = this.#line("lookup", icon(lookupIcon(activity.label), 12));
         line.append(el("span", "line-text", activity.label));
-        this.onChange();
         break;
       }
       case "open": {
@@ -129,7 +127,6 @@ export class Trace {
         const text = el("span", "line-text", `Opening ${activity.label} for `);
         text.append(el("q", undefined, activity.query));
         line.append(text);
-        this.onChange();
         break;
       }
       case "scroll": {
@@ -140,7 +137,6 @@ export class Trace {
         }
         const line = this.#line("scroll", icon(looking ? "eye" : "mouse", 12));
         line.append(el("span", "line-text", activity.label));
-        this.onChange();
         break;
       }
       case "click": {
@@ -150,13 +146,37 @@ export class Trace {
         const text = el("span", "line-text", "Clicking ");
         text.append(el("q", undefined, activity.label));
         line.append(text);
-        this.onChange();
+        break;
+      }
+      case "browse": {
+        this.#pages++;
+        this.setPhase("browsing");
+        const line = this.#line("browse", icon("globe", 12));
+        const opening = activity.url !== undefined;
+        const text = el("span", "line-text", opening ? "Opening " : activity.label);
+        if (opening) text.append(el("q", undefined, activity.label));
+        line.append(text);
+        if (activity.url) this.#hosts.add(hostOf(activity.url));
+        break;
+      }
+      case "window": {
+        this.setPhase("acting");
+        const line = this.#line("window", icon("appWindow", 12));
+        line.append(el("span", "line-text", activity.label));
+        break;
+      }
+      case "act": {
+        this.#clicks++;
+        this.setPhase("acting");
+        const line = this.#line("act", icon("keyboard", 12));
+        line.append(el("span", "line-text", activity.label));
         break;
       }
     }
+    this.onChange();
   }
 
-  /** Also used for older servers, which only report the query in a status event. */
+  /** Also used when a turn reports the query only in a status event. */
   addSearch(query: string): void {
     if (this.#finished || this.#queries.has(query)) return;
     this.#queries.add(query);
@@ -187,15 +207,12 @@ export class Trace {
     this.#hosts.add(host);
     let line = this.#reads.get(url);
     if (!line) {
-      line = this.#line("read", icon("file", 12));
+      line = this.#line("read");
       this.#reads.set(url, line);
     }
     const text = el("span", "line-text", "Reading ");
-    if (title) text.append(el("q", undefined, title));
-    else text.append(host);
-    line.replaceChildren(icon("file", 12), text);
-    if (title) line.append(el("span", "host", host));
-    this.onChange();
+    text.append(title ? el("q", undefined, title) : host);
+    line.replaceChildren(icon("file", 12), text, ...(title ? [el("span", "host", host)] : []));
   }
 
   #line(kind: string, lead?: SVGElement, paragraph?: number): HTMLLIElement {
@@ -207,22 +224,22 @@ export class Trace {
     return node;
   }
 
+  /** The thought lines, one per paragraph: only the newest paragraph can still change. */
   #renderThoughts(): void {
     cancelAnimationFrame(this.#frame);
     this.#frame = 0;
     const parts = paragraphs(this.#thinking);
-    for (let index = this.#paragraphs; index < parts.length; index++) {
-      const line = this.#line("thought", undefined, index);
-      line.append(el("span", "line-text"));
+    const from = Math.max(0, this.#thoughts.length - 1);
+    for (let index = this.#thoughts.length; index < parts.length; index++) {
+      const text = el("span", "line-text");
+      this.#line("thought", undefined, index).append(text);
+      this.#thoughts.push(text);
     }
-    this.#paragraphs = Math.max(this.#paragraphs, parts.length);
-    for (const { node, paragraph } of this.#lines) {
-      if (paragraph === undefined) continue;
-      const text = node.querySelector(".line-text");
-      const line = thoughtLine(parts[paragraph] ?? "");
-      if (text && text.textContent !== line) text.textContent = line;
+    for (let index = from; index < parts.length; index++) {
+      const line = thoughtLine(parts[index] ?? "");
+      const text = this.#thoughts[index]!;
+      if (text.textContent !== line) text.textContent = line;
     }
-    this.onChange();
   }
 
   /** Shows the newest lines while live, everything once finished and opened. */
@@ -269,7 +286,8 @@ export class Trace {
       searches > 0 ? plural(searches, "search", "searches") : null,
       this.#hosts.size > 0 ? plural(this.#hosts.size, "source") : null,
       this.#scrolls > 0 ? plural(this.#scrolls, "scroll") : null,
-      this.#clicks > 0 ? plural(this.#clicks, "click") : null,
+      this.#clicks > 0 ? plural(this.#clicks, "step") : null,
+      this.#pages > 0 ? plural(this.#pages, "page") : null,
     ].filter(Boolean);
     this.#meta.textContent = stats.length > 0 ? `· ${stats.join(" · ")}` : "";
     if (this.#thinking.trim()) this.#full.textContent = this.#thinking.trim();

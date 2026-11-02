@@ -1,7 +1,9 @@
 import { execFile } from "node:child_process";
+import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { clipboard, desktopCapturer, screen, systemPreferences } from "electron";
 import type { ScreenshotPolicy } from "../../shared-types.ts";
+import { resolveApp } from "../apps/registry.ts";
 import { keepClipboard } from "../clipboard.ts";
 import { toScreenshot, type EditTarget, type RawCapture } from "./common.ts";
 
@@ -31,7 +33,11 @@ JSON.stringify(out);
 
 /** Focused elements that take typed text, so a paste goes in at their cursor. */
 const TEXT_ROLES = new Set(["AXTextField", "AXTextArea", "AXComboBox"]);
-const TERMINALS = new Set(["Terminal", "iTerm2", "Ghostty", "WezTerm", "Alacritty", "kitty", "Warp"]);
+
+/** Whether the app named `appName` on macOS is a terminal Kiki knows. */
+export function isMacTerminal(appName: string): boolean {
+  return resolveApp({ macName: appName.toLowerCase() })?.handler.kind === "terminal";
+}
 
 interface FrontApp {
   appName: string;
@@ -46,12 +52,10 @@ interface FrontApp {
 function macEditTarget(front: FrontApp, selection: string): EditTarget | undefined {
   if (!front.pid || !TEXT_ROLES.has(front.role)) return undefined;
   // What's highlighted in a terminal is its output: text goes in at the prompt.
-  const terminal = TERMINALS.has(front.appName);
+  const terminal = isMacTerminal(front.appName);
   const original = terminal ? "" : selection;
   return { mode: original ? "replace" : "insert", original, kind: terminal ? "terminal" : "field", macPid: front.pid };
 }
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Copies the selection with Cmd+C, then restores whatever was on the clipboard. */
 async function copySelection(): Promise<string> {

@@ -1,19 +1,24 @@
 import { LIMITS } from "@kiki/shared";
-import type { ScreenshotPolicy } from "../../shared-types.ts";
+import type { NearbyTextPolicy, ScreenshotPolicy } from "../../shared-types.ts";
 import { CONTEXT_CHARS, VICINITY, type Capture, type LineBudget, type RawCapture, type Vicinity } from "./common.ts";
-import { captureLinux } from "./linux.ts";
+import { captureLinux, warmHelpers } from "./linux.ts";
 import { captureMac } from "./mac.ts";
 
 export type { Capture } from "./common.ts";
 
-export async function captureContext(policy: ScreenshotPolicy): Promise<Capture> {
+/** Gets the next capture ready ahead of the hotkey. */
+export function prepareCapture(): void {
+  if (process.platform === "linux") warmHelpers();
+}
+
+export async function captureContext(policy: ScreenshotPolicy, nearby: NearbyTextPolicy): Promise<Capture> {
   let raw: RawCapture;
-  if (process.platform === "linux") raw = await captureLinux(policy);
+  if (process.platform === "linux") raw = await captureLinux(policy, nearby);
   else if (process.platform === "darwin") raw = await captureMac(policy);
   else raw = { selection: "", notes: ["Kiki can only read other apps on Linux and macOS."] };
 
   const { vicinity, focus, fullText, ...rest } = raw;
-  const selection = raw.selection.trim().slice(0, LIMITS.selectionChars);
+  const selection = cleanSelection(raw.selection);
   return {
     ...rest,
     selection,
@@ -21,8 +26,22 @@ export async function captureContext(policy: ScreenshotPolicy): Promise<Capture>
     windowTitle: raw.windowTitle?.slice(0, LIMITS.windowTitleChars) || undefined,
     url: raw.url && raw.url.length <= LIMITS.urlChars ? raw.url : undefined,
     text: nearbyText(vicinity ? vicinityText(vicinity, selection) : raw.text, selection, focus),
-    fullText: fullText?.then((full) => full && nearbyText(full.text, selection, full.focus)),
+    fullText: fullText?.then((full) => {
+      if (!full) return undefined;
+      const { focus: at, vicinity: lines, ...late } = full;
+      // An empty selection says nothing is highlighted in the page.
+      const around = late.selection !== undefined ? cleanSelection(late.selection) : selection;
+      return {
+        ...late,
+        text: nearbyText(lines ? vicinityText(lines, around) : late.text, around, at) ?? "",
+        ...(late.selection !== undefined ? { selection: around } : {}),
+      };
+    }),
   };
+}
+
+function cleanSelection(selection: string): string {
+  return selection.trim().slice(0, LIMITS.selectionChars);
 }
 
 function nearbyText(text: string | undefined, selection: string, focus?: number): string | undefined {

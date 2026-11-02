@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { cropAround } from "../resources/gnome-extension/kiki-popup@kiki.app/crop.js";
 import { trimLines } from "../src/main/capture/index.ts";
-import { primaryFitsVicinity } from "../src/main/capture/linux.ts";
+import { pageRulesOutPrimary, primaryFitsVicinity } from "../src/main/capture/linux.ts";
 
 /** "line 1\nline 2…" for lines `from` to `to`. */
 function lines(from: number, to: number): string {
@@ -105,5 +105,29 @@ describe("primaryFitsVicinity", () => {
   it("leaves the primary selection alone without a caret-only vicinity", () => {
     expect(primaryFitsVicinity("anything", undefined)).toBe(true);
     expect(primaryFitsVicinity("anything", { ...terminal, anchor: "ls" })).toBe(true);
+  });
+});
+
+describe("pageRulesOutPrimary", () => {
+  const page = { ok: true, source: "document" as const, url: "https://www.google.com/search?q=vm" };
+
+  it("ignores the primary selection on a page with nothing highlighted", () => {
+    expect(pageRulesOutPrimary({ ...page, pageSelected: false })).toBe(true);
+  });
+
+  it("keeps it when the page has a highlight, or doesn't say", () => {
+    expect(pageRulesOutPrimary({ ...page, pageSelected: true })).toBe(false);
+    expect(pageRulesOutPrimary(page)).toBe(false);
+  });
+
+  it("keeps it in a Google Doc, which draws its own highlight", () => {
+    const doc = { ...page, url: "https://docs.google.com/document/d/abc/edit", pageSelected: false };
+    expect(pageRulesOutPrimary(doc)).toBe(false);
+  });
+
+  it("leaves other windows and failed reads to the other checks", () => {
+    expect(pageRulesOutPrimary({ ok: true, source: "terminal", pageSelected: false })).toBe(false);
+    expect(pageRulesOutPrimary({ ok: true, source: "window", pageSelected: false })).toBe(false);
+    expect(pageRulesOutPrimary({ ok: false, error: "timed out" })).toBe(false);
   });
 });

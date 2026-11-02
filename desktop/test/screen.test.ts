@@ -7,7 +7,9 @@ import { applyEdits, describeAction } from "../src/main/google/format.ts";
 import {
   clickControl,
   clickRefusal,
+  dedupeScreen,
   describePresses,
+  diffScreen,
   mergeFields,
   newScreenState,
   pressProblems,
@@ -64,6 +66,69 @@ describe("screenText", () => {
     const state = newScreenState();
     expect(screenText(`Press ⟦b9 Delete account⟧ now ${marker(3, "Share")}`, [], state)).toBe("Press b9 Delete account now Share");
     expect(state.controls.size).toBe(0);
+  });
+});
+
+describe("dedupeScreen", () => {
+  const feed = (...posts: string[]) => posts.join("\n");
+
+  it("leaves out the lines a screen shares with the one before, after a scroll down or up", () => {
+    const first = feed("Jane: my code works", "on the first try", "Sam: lunch?", "Lee: new photo", "of the lake", "at dawn");
+    const second = feed("Lee: new photo", "of the lake", "at dawn", "Kim: hiring", "two engineers");
+    expect(dedupeScreen(first, second, "down")).toEqual({
+      text: feed("(The first 3 lines were on the previous screen.)", "Kim: hiring", "two engineers"),
+      shared: 3,
+    });
+    expect(dedupeScreen(second, first, "up")).toEqual({
+      text: feed("Jane: my code works", "on the first try", "Sam: lunch?", "(The last 3 lines were on the previous screen.)"),
+      shared: 3,
+    });
+  });
+
+  it("matches controls whose index changed between reads, and keeps small overlaps", () => {
+    const first = feed("Jane: my code works on the first try", `${marker(0, "Like")} ${marker(1, "Comment")}`);
+    const second = feed("Jane: my code works on the first try", `${marker(3, "Like")} ${marker(4, "Comment")}`, "Sam: lunch?");
+    expect(dedupeScreen(first, second, "down")).toEqual({ text: feed("(The first 2 lines were on the previous screen.)", "Sam: lunch?"), shared: 2 });
+    // One short line (a heading, "Like") says nothing about where the last screen ended.
+    expect(dedupeScreen(feed("Posts", "Like"), feed("Like", "Sam: lunch?"), "down")).toEqual({ text: feed("Like", "Sam: lunch?"), shared: 0 });
+  });
+
+  it("says when nothing is new, and leaves the first screen alone", () => {
+    expect(dedupeScreen("A\nB\nC", "A\nB\nC", "down")).toEqual({ text: "(Nothing new: all of this screen was on the previous one.)", shared: 3 });
+    expect(dedupeScreen(undefined, "A\nB", "down")).toEqual({ text: "A\nB", shared: 0 });
+    expect(dedupeScreen("X\nY", "A\nB", "down")).toEqual({ text: "A\nB", shared: 0 });
+  });
+});
+
+describe("diffScreen", () => {
+  const lines = (count: number, prefix = "Line") => Array.from({ length: count }, (_, i) => `${prefix} ${i + 1}`);
+
+  it("folds the lines a page kept into a note, with a line of context around what changed", () => {
+    const before = [...lines(10), "Comments (3)", ...lines(8, "Comment")].join("\n");
+    const after = [...lines(10), "Comments (4)", "Comment new", ...lines(8, "Comment")].join("\n");
+    const { text, diffed } = diffScreen(before, after);
+    expect(diffed).toBe(true);
+    expect(text.split("\n")).toEqual([
+      "(… 9 lines unchanged, as in your last look …)",
+      "Line 10",
+      "Comments (4)",
+      "Comment new",
+      "Comment 1",
+      "(… 7 lines unchanged, as in your last look …)",
+    ]);
+  });
+
+  it("keeps short unchanged runs, and sends the whole screen when most of it changed", () => {
+    const before = ["A", "B", "C", "D"].join("\n");
+    expect(diffScreen(before, ["A", "B", "X", "D"].join("\n"))).toEqual({ text: "A\nB\nX\nD", diffed: true });
+    const changed = ["A", "x", "y", "z", "w"].join("\n");
+    expect(diffScreen(before, changed)).toEqual({ text: changed, diffed: false });
+  });
+
+  it("says when nothing changed, and leaves a first read alone", () => {
+    expect(diffScreen("A\nB", "A\nB")).toEqual({ text: "(The page reads the same as your last look.)", diffed: true });
+    expect(diffScreen(undefined, "A\nB")).toEqual({ text: "A\nB", diffed: false });
+    expect(diffScreen("A\nB", "")).toEqual({ text: "", diffed: false });
   });
 });
 
@@ -128,6 +193,36 @@ describe("clicks", () => {
     expect(clickRefusal(control("page tab", "Issues"))).toBeNull();
     expect(clickRefusal(control("menu item", "Newest first"))).toBeNull();
     expect(clickRefusal(control("push button", "Show more"))).toBeNull();
+  });
+
+  it("press the same things in Kiki's browser, by Chrome's role names", () => {
+    expect(clickRefusal(control("tab", "Issues"))).toBeNull();
+    expect(clickRefusal(control("menuitem", "Newest first"))).toBeNull();
+    expect(clickRefusal(control("button", "Show more"))).toBeNull();
+    expect(clickRefusal(control("treeitem", "src"))).toBeNull();
+    expect(clickRefusal(control("option", "Blue"))).toBeNull();
+    expect(clickRefusal(control("button", "Like"))).toContain("propose_press");
+    expect(clickRefusal(control("togglebutton", "Reactions"))).toContain("propose_press");
+  });
+
+  it("press anything but what pays when the person set Kiki to act without asking", () => {
+    const auto = { auto: true };
+    expect(clickRefusal(control("push button", "Like"), auto)).toBeNull();
+    expect(clickRefusal(control("toggle button", "Follow"), auto)).toBeNull();
+    expect(clickRefusal(control("button", "Send"), auto)).toBeNull();
+    expect(clickRefusal(control("check box", "Remember me"), auto)).toBeNull();
+    for (const name of ["Buy now", "Checkout", "Place your order", "Pay", "Confirm payment", "Subscribe now"]) {
+      expect(clickRefusal(control("button", name), auto), name).toContain("pays for something");
+    }
+    // Off, the usual rule holds.
+    expect(clickRefusal(control("push button", "Like"), { auto: false })).toContain("propose_press");
+  });
+
+  it("answer a cookie notice right away, with its own buttons", () => {
+    expect(clickRefusal({ ...control("button", "Accept all"), consent: true })).toBeNull();
+    expect(clickRefusal({ ...control("button", "Reject all"), consent: true })).toBeNull();
+    // Without the notice around it, an Accept button may accept anything.
+    expect(clickRefusal(control("button", "Accept all"))).toContain("propose_press");
   });
 
   it("leave toggles and anything that changes something to a press card", () => {

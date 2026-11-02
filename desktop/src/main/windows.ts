@@ -2,14 +2,15 @@ import { join } from "node:path";
 import { app, BrowserWindow, shell } from "electron";
 import { POPUP_WIDTH } from "../renderer/layout.ts";
 
-export const isWayland = process.platform === "linux" && Boolean(process.env.WAYLAND_DISPLAY);
+export const isLinux = process.platform === "linux";
+export const isWayland = isLinux && Boolean(process.env.WAYLAND_DISPLAY);
 export const isMac = process.platform === "darwin";
 
 export function preloadPath(): string {
   return join(import.meta.dirname, "../preload/index.cjs");
 }
 
-export function loadPage(window: BrowserWindow, page: "popup" | "settings"): void {
+export function loadPage(window: BrowserWindow, page: "popup" | "settings" | "browser"): void {
   const devServer = process.env.ELECTRON_RENDERER_URL;
   if (devServer) void window.loadURL(`${devServer}/${page}.html`);
   else void window.loadFile(join(import.meta.dirname, `../renderer/${page}.html`));
@@ -65,7 +66,7 @@ export function createPopupWindow(): BrowserWindow {
     skipTaskbar: true,
     alwaysOnTop: true,
     ...(isMac ? { type: "panel" } : {}),
-    ...(process.platform === "linux" ? { icon: join(app.getAppPath(), "resources", "icon.png") } : {}),
+    ...(isLinux ? { icon: join(app.getAppPath(), "resources", "icon.png") } : {}),
     webPreferences: webPreferences(),
   });
   if (isMac) {
@@ -91,7 +92,7 @@ export function createWindow(options: {
     title: options.title,
     show: false,
     autoHideMenuBar: true,
-    ...(process.platform === "linux" ? { icon: join(app.getAppPath(), "resources", "icon.png") } : {}),
+    ...(isLinux ? { icon: join(app.getAppPath(), "resources", "icon.png") } : {}),
     webPreferences: webPreferences(),
   });
   hardenWindow(window);

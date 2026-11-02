@@ -6,4 +6,5 @@ release/
 *.db-*
 .env
 .DS_Store
-hidden_README.md
+hidden_*.md
+__pycache__/

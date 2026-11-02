@@ -1,6 +1,6 @@
 import { LIMITS } from "@kiki/shared";
 import { describe, expect, it } from "vitest";
-import { earlierTurns, newEntry, upsertEntry } from "../src/main/history.ts";
+import { earlierTurns, newEntry, pruneEntries, RETENTION_MS, upsertEntry } from "../src/main/history.ts";
 import { formatWhen } from "../src/renderer/feed.ts";
 
 describe("formatWhen", () => {
@@ -45,6 +45,25 @@ describe("history entries", () => {
     expect(upsertEntry([a!, b!], c!).map((entry) => entry.id)).toEqual([c!.id, a!.id, b!.id]);
     expect(upsertEntry([a!, b!, c!], b!).map((entry) => entry.id)).toEqual([b!.id, a!.id, c!.id]);
     expect(upsertEntry([a!, b!], c!, 2).map((entry) => entry.id)).toEqual([c!.id, a!.id]);
+  });
+
+  it("keeps saved sessions past the cap", () => {
+    const [a, b, c] = [newEntry(context), newEntry(context), newEntry(context)];
+    const saved = { ...a!, saved: true };
+    expect(upsertEntry([b!, saved], c!, 1).map((entry) => entry.id)).toEqual([c!.id, saved.id]);
+  });
+
+  it("deletes unsaved sessions a week after they were last used", () => {
+    const now = Date.UTC(2026, 9, 19);
+    const fresh = newEntry(context, now - RETENTION_MS + 60_000);
+    const stale = newEntry(context, now - RETENTION_MS - 60_000);
+    const saved = { ...newEntry(context, now - 30 * RETENTION_MS), saved: true };
+    expect(pruneEntries([fresh, stale, saved], now).map((entry) => entry.id)).toEqual([fresh.id, saved.id]);
+  });
+
+  it("says what a later highlight was when a restarted conversation carries the turn", () => {
+    const [turn] = earlierTurns([{ question: "And this?", answer: "It's a mascot.", highlight: "  Kiki\n the triangle " }]);
+    expect(turn!.question).toBe('[Highlighted: "Kiki\n the triangle"]\nAnd this?');
   });
 
   it("carries over the latest turns, with long answers cut short", () => {

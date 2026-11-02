@@ -35,6 +35,10 @@
           <div id="history" class="history" aria-label="Past sessions"></div>
         </div>
         <form id="composer" class="composer">
+          <p id="helperNote" class="helper-note" role="status" hidden>
+            <span id="helperNoteText">Kiki's GNOME helper is switched off, so this box opens here and closes when you switch windows.</span>
+            <button id="helperOn" class="provider-settings" type="button">Turn on</button>
+          </p>
           <div id="context" class="context">
             <div id="chips" class="chips"></div>
             <p id="notes" class="notes" hidden></p>
@@ -59,8 +63,8 @@
               </button>
             </div>
             <div class="tools">
-              <button id="attach" class="icon-button" type="button" aria-label="Add images" title="Add images"></button>
-              <input id="file" type="file" accept="image/*" multiple hidden />
+              <button id="attach" class="icon-button" type="button" aria-label="Add images or files" title="Add images or files"></button>
+              <input id="file" type="file" multiple hidden />
               <button id="send" class="send" type="submit" aria-label="Ask">
                 <span class="send-icon send-arrow"></span><span class="send-icon send-stop"></span>
               </button>
@@ -69,6 +73,11 @@
         </form>
       </section>
       <div id="modelMenu" class="model-menu" role="menu" aria-label="Model">
+        <div id="providerTabs" class="provider-tabs" role="group" aria-label="Provider" hidden></div>
+        <div id="providerHint" class="provider-hint" hidden>
+          <p id="providerHintText"></p>
+          <button id="providerSettings" class="provider-settings" type="button">Open Settings</button>
+        </div>
         <div id="modelItems" class="menu-items"><span class="menu-highlight"></span></div>
       </div>
     </div>

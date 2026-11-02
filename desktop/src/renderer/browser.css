@@ -1,0 +1,80 @@
+:root {
+  color-scheme: dark;
+  --bar-bg: #141416;
+  --bar-fg: #f4f4f5;
+  --bar-muted: rgba(244, 244, 245, 0.6);
+  --accent: #7c5cff;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bar-bg);
+  color: var(--bar-fg);
+  font-family: "Geist Variable", system-ui, sans-serif;
+  font-size: 13px;
+  overflow: hidden;
+}
+
+#bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 44px;
+  padding: 0 12px;
+  box-sizing: border-box;
+}
+
+#dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: none;
+}
+
+.taken-over #dot {
+  background: #22c55e;
+}
+
+#label {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 40%;
+}
+
+#url {
+  flex: 1;
+  color: var(--bar-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+
+button {
+  flex: none;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--bar-fg);
+  border: 0;
+  border-radius: 14px;
+  padding: 5px 12px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+#keep.on {
+  background: var(--accent);
+}
+
+#stop {
+  background: rgba(239, 68, 68, 0.25);
+}

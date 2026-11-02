@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { trimAround } from "../src/main/capture/index.ts";
 import { parseStrv, toGnomeBinding } from "../src/main/linuxSetup.ts";
-import { validateServerUrl } from "../src/main/settings.ts";
+import { checkBaseUrl, serviceName } from "../src/services.ts";
 
 describe("toGnomeBinding", () => {
   it("converts Electron accelerators to GNOME bindings", () => {
@@ -58,12 +58,20 @@ describe("trimAround", () => {
   });
 });
 
-describe("validateServerUrl", () => {
-  it("requires https except for this machine", () => {
-    expect(validateServerUrl("https://kiki.example.com")).toBeNull();
-    expect(validateServerUrl("http://127.0.0.1:8787")).toBeNull();
-    expect(validateServerUrl("http://localhost:8787")).toBeNull();
-    expect(validateServerUrl("http://kiki.example.com")).toMatch(/https/);
-    expect(validateServerUrl("kiki.example.com")).toMatch(/full address/);
+describe("checkBaseUrl", () => {
+  it("takes https anywhere, and http only on this computer or the local network", () => {
+    expect(checkBaseUrl("https://openrouter.ai/api/v1/")).toEqual({ url: "https://openrouter.ai/api/v1" });
+    expect(checkBaseUrl(" http://localhost:11434/v1 ")).toEqual({ url: "http://localhost:11434/v1" });
+    expect(checkBaseUrl("http://127.0.0.1:1234/v1")).toEqual({ url: "http://127.0.0.1:1234/v1" });
+    expect(checkBaseUrl("http://192.168.1.20:11434/v1")).toEqual({ url: "http://192.168.1.20:11434/v1" });
+    expect(checkBaseUrl("http://box.local:8080/v1")).toEqual({ url: "http://box.local:8080/v1" });
+    expect(checkBaseUrl("http://models.example.com/v1")).toMatchObject({ error: expect.stringContaining("https://") });
+    expect(checkBaseUrl("localhost:11434")).toMatchObject({ error: expect.stringContaining("https://") });
+    expect(checkBaseUrl("not a url")).toMatchObject({ error: expect.stringContaining("full address") });
+  });
+
+  it("names a service, or its host for other addresses", () => {
+    expect(serviceName("ollama", "http://localhost:11434/v1")).toBe("Ollama");
+    expect(serviceName("custom", "http://localhost:8080/v1")).toBe("localhost:8080");
   });
 });

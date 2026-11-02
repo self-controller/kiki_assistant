@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:" />
+    <title>Kiki's browser</title>
+  </head>
+  <body class="browser-toolbar">
+    <div id="bar">
+      <span id="dot" aria-hidden="true"></span>
+      <span id="label">Kiki is browsing</span>
+      <span id="url" title=""></span>
+      <button id="keep" type="button" title="Keep this page after the answer">Keep</button>
+      <button id="stop" type="button" title="Stop what Kiki is doing">Stop</button>
+      <button id="hide" type="button" title="Hide the browser">Hide</button>
+    </div>
+    <script type="module" src="./browser.ts"></script>
+  </body>
+</html>

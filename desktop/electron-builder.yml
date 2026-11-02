@@ -1,5 +1,13 @@
 appId: app.kiki.desktop
 productName: Kiki
+# Kiki-0.2.0-x86_64.AppImage, Kiki-0.2.0-x86_64.rpm, Kiki-0.2.0-amd64.deb
+artifactName: ${productName}-${version}-${arch}.${ext}
+# `--publish always` (the release workflow) uploads to a draft GitHub Release for the tag.
+publish:
+  provider: github
+  owner: self-controller
+  repo: kiki_assistant
+  releaseType: draft
 directories:
   output: release
   buildResources: resources
@@ -17,6 +25,8 @@ extraResources:
 linux:
   target: [AppImage, rpm, deb]
   executableName: kiki
+  # The deb needs a maintainer; GitHub's no-reply address keeps a personal one out of the package.
+  maintainer: Kiki <self-controller@users.noreply.github.com>
   category: Utility
   icon: resources/icon.png
   synopsis: Highlight text anywhere and ask Kiki about it
@@ -31,4 +41,3 @@ mac:
   extendInfo:
     LSUIElement: true
     NSAppleEventsUsageDescription: Kiki reads the selected text and window title from the app you're using.
-    NSMicrophoneUsageDescription: Kiki records your voice only after you click the mic button, to turn your spoken question into text.

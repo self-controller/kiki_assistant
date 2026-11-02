@@ -23,6 +23,7 @@ export default defineConfig({
         input: {
           popup: resolve(import.meta.dirname, "src/renderer/popup.html"),
           settings: resolve(import.meta.dirname, "src/renderer/settings.html"),
+          browser: resolve(import.meta.dirname, "src/renderer/browser.html"),
         },
       },
     },
